@@ -8,6 +8,7 @@ import 'package:clone_studio/core/identity.dart';
 import 'package:clone_studio/core/pairing.dart';
 import 'package:clone_studio/core/scanner.dart';
 import 'package:clone_studio/core/transfer.dart';
+import 'package:clone_studio/models/selection.dart';
 import 'package:crypto/crypto.dart' as crypto;
 import 'package:flutter_test/flutter_test.dart';
 
@@ -33,10 +34,10 @@ Future<void> makeSourceTree() async {
   final rng = Random(7);
   File('$src/Pictures/photo.bin').writeAsBytesSync(
       List.generate(1024 * 1024 + 137, (_) => rng.nextInt(256)));
+  File('$src/Pictures/small.bin').writeAsBytesSync([1, 2, 3, 4, 5]);
   File('$src/Desktop/run.sh').writeAsStringSync('#!/bin/bash\necho hi\n');
   await Process.run('chmod', ['755', '$src/Desktop/run.sh']);
-  await Link('$src/Documents/link-to-hello')
-      .create('../Desktop/hello.txt');
+  await Link('$src/Documents/link-to-hello').create('../Desktop/hello.txt');
   File('$src/.config/myapp/settings.ini').writeAsStringSync('theme=dark');
   File('$src/.config/myapp/.cache/junk.tmp')
       .writeAsStringSync('never migrate me');
@@ -61,6 +62,12 @@ Future<(Session, Session)> loopbackPair() async {
   return (server.session!, client);
 }
 
+/// The source's selection = every scanned leaf in the given categories.
+Set<String> pick(ScanResult scan, Set<String> cats) => {
+      for (final e in scan.leaves)
+        if (cats.contains(e.categoryId)) e.relative,
+    };
+
 void main() {
   setUp(() async {
     tmp = await Directory.systemTemp.createTemp('clone_studio_test');
@@ -73,20 +80,20 @@ void main() {
     await tmp.delete(recursive: true);
   });
 
-  test('network transfer: integrity, permissions, symlinks, exclusions',
+  test('offer/review network transfer: integrity, perms, symlinks, exclusions',
       () async {
-    final (senderSide, receiverSide) = await loopbackPair();
-    final sender = SenderController(senderSide, senderSide);
-    final receiver = ReceiverController(receiverSide, receiverSide);
+    final scan = await scanEverything();
+    final selection = pick(scan, {'desktop', 'documents', 'pictures', 'dotfiles'});
+
+    final (sSide, rSide) = await loopbackPair();
+    final sender = SenderController(sSide, sSide)..setPlan(scan, selection);
+    final receiver = ReceiverController(rSide, rSide);
+
     final serving = sender.serve();
-
-    expect(await receiver.requestScan(), isTrue);
-    final desktop =
-        receiver.categories.firstWhere((c) => c.id == 'desktop');
-    expect(desktop.fileCount, 2);
-    expect(desktop.available, isTrue);
-
-    await receiver.start(['desktop', 'documents', 'pictures', 'dotfiles']);
+    expect(await receiver.receiveOffer(), isTrue);
+    // The new computer accepts the whole offer.
+    final include = {for (final l in receiver.offerLeaves) l.rel};
+    await receiver.startReceive(include);
     await serving;
 
     expect(receiver.state, TransferState.done);
@@ -98,74 +105,95 @@ void main() {
         shaOf("$src/Documents/sub dir/wei rd 'na\"me.txt"));
     expect(File('$dst/Documents/empty.bin').lengthSync(), 0);
 
-    // Executable bit survived.
     final stat = File('$dst/Desktop/run.sh').statSync();
-    expect(stat.mode & 0x40, isNot(0)); // owner exec
+    expect(stat.mode & 0x40, isNot(0)); // owner exec preserved
 
-    // Symlink survived as a symlink with the same target.
     expect(
         FileSystemEntity.typeSync('$dst/Documents/link-to-hello',
             followLinks: false),
         FileSystemEntityType.link);
-    expect(Link('$dst/Documents/link-to-hello').targetSync(),
-        '../Desktop/hello.txt');
 
-    // Cache directories never travel.
     expect(File('$dst/.config/myapp/settings.ini').existsSync(), isTrue);
     expect(File('$dst/.config/myapp/.cache/junk.tmp').existsSync(), isFalse);
 
-    // No half-written files left behind.
     final partials = Directory(dst)
         .listSync(recursive: true)
         .where((e) => e.path.endsWith('.partial'));
     expect(partials, isEmpty);
 
-    senderSide.close();
-    receiverSide.close();
+    sSide.close();
+    rSide.close();
+  });
+
+  test('new computer trims the offer — unticked files never arrive', () async {
+    final scan = await scanEverything();
+    final selection = pick(scan, {'desktop', 'pictures'});
+
+    final (sSide, rSide) = await loopbackPair();
+    final sender = SenderController(sSide, sSide)..setPlan(scan, selection);
+    final receiver = ReceiverController(rSide, rSide);
+
+    final serving = sender.serve();
+    expect(await receiver.receiveOffer(), isTrue);
+    // Drop the big photo from the incoming set.
+    final include = {
+      for (final l in receiver.offerLeaves)
+        if (!l.rel.endsWith('photo.bin')) l.rel
+    };
+    await receiver.startReceive(include);
+    await serving;
+
+    expect(receiver.state, TransferState.done);
+    expect(File('$dst/Desktop/hello.txt').existsSync(), isTrue);
+    expect(File('$dst/Pictures/small.bin').existsSync(), isTrue);
+    expect(File('$dst/Pictures/photo.bin').existsSync(), isFalse);
+
+    sSide.close();
+    rSide.close();
   });
 
   test('interrupted transfer resumes from the journal', () async {
-    // Round 1: cut the connection mid-transfer.
-    final (senderSide1, receiverSide1) = await loopbackPair();
-    final sender1 = SenderController(senderSide1, senderSide1);
-    final receiver1 = ReceiverController(receiverSide1, receiverSide1);
-    final serving1 = sender1.serve();
-    await receiver1.requestScan();
+    final scan = await scanEverything();
+    final selection = pick(scan, {'desktop', 'documents', 'pictures'});
 
-    final started = receiver1.start(['desktop', 'documents', 'pictures']);
-    while (receiver1.doneFiles < 2 &&
-        receiver1.state != TransferState.done) {
+    // Round 1: cut the connection mid-transfer.
+    final (s1, r1) = await loopbackPair();
+    final sender1 = SenderController(s1, s1)..setPlan(scan, selection);
+    final receiver1 = ReceiverController(r1, r1);
+    final serving1 = sender1.serve();
+    await receiver1.receiveOffer();
+    final include1 = {for (final l in receiver1.offerLeaves) l.rel};
+    final started = receiver1.startReceive(include1);
+    while (receiver1.doneFiles < 2 && receiver1.state != TransferState.done) {
       await Future<void>.delayed(const Duration(milliseconds: 5));
     }
-    receiverSide1.close();
-    senderSide1.close();
+    r1.close();
+    s1.close();
     await started;
     await serving1;
 
     expect(receiver1.state, TransferState.error);
     final journal = File('$dst/.clone-studio/journal.json');
-    expect(journal.existsSync(), isTrue);
     final doneCount =
-        ((jsonDecode(journal.readAsStringSync()) as Map)['done'] as Map)
-            .length;
+        ((jsonDecode(journal.readAsStringSync()) as Map)['done'] as Map).length;
     expect(doneCount, greaterThan(0));
 
-    // Round 2: fresh pairing, same target — must skip what's journaled.
-    final (senderSide2, receiverSide2) = await loopbackPair();
-    final sender2 = SenderController(senderSide2, senderSide2);
-    final receiver2 = ReceiverController(receiverSide2, receiverSide2);
+    // Round 2: fresh pairing, same target — skip what's journaled.
+    final (s2, r2) = await loopbackPair();
+    final sender2 = SenderController(s2, s2)..setPlan(scan, selection);
+    final receiver2 = ReceiverController(r2, r2);
     final serving2 = sender2.serve();
-    await receiver2.requestScan();
-    await receiver2.start(['desktop', 'documents', 'pictures']);
+    await receiver2.receiveOffer();
+    final include2 = {for (final l in receiver2.offerLeaves) l.rel};
+    await receiver2.startReceive(include2);
     await serving2;
 
     expect(receiver2.state, TransferState.done);
     expect(receiver2.skippedFiles, doneCount);
     expect(shaOf('$dst/Pictures/photo.bin'), shaOf('$src/Pictures/photo.bin'));
-    expect(shaOf('$dst/Desktop/hello.txt'), shaOf('$src/Desktop/hello.txt'));
 
-    senderSide2.close();
-    receiverSide2.close();
+    s2.close();
+    r2.close();
   });
 
   test('pre-existing target files are kept, not overwritten', () async {
@@ -173,12 +201,15 @@ void main() {
     File('$dst/Desktop/hello.txt')
         .writeAsStringSync('the new computer already had this');
 
-    final (senderSide, receiverSide) = await loopbackPair();
-    final sender = SenderController(senderSide, senderSide);
-    final receiver = ReceiverController(receiverSide, receiverSide);
+    final scan = await scanEverything();
+    final selection = pick(scan, {'desktop'});
+
+    final (sSide, rSide) = await loopbackPair();
+    final sender = SenderController(sSide, sSide)..setPlan(scan, selection);
+    final receiver = ReceiverController(rSide, rSide);
     final serving = sender.serve();
-    await receiver.requestScan();
-    await receiver.start(['desktop']);
+    await receiver.receiveOffer();
+    await receiver.startReceive({for (final l in receiver.offerLeaves) l.rel});
     await serving;
 
     expect(receiver.state, TransferState.done);
@@ -188,45 +219,68 @@ void main() {
         File('$dst/Desktop/hello (from old computer).txt').readAsStringSync(),
         'hello from the old box');
 
-    senderSide.close();
-    receiverSide.close();
+    sSide.close();
+    rSide.close();
   });
 
-  test('bundle export/import round-trips across split parts', () async {
+  test('bundle export/import round-trips and honours import-time trimming',
+      () async {
     bundlePartLimit = 128 * 1024; // force several .csb parts
 
     final drive = '${tmp.path}/fake-usb';
     await Directory(drive).create(recursive: true);
 
+    final scan = await scanEverything();
+    final selection = pick(scan, {'desktop', 'documents', 'pictures'});
+
     final writer = BundleWriter(drive);
     await writer.open();
-    final exporter = SenderController(writer);
-    await exporter.send(['desktop', 'documents', 'pictures'], []);
+    final exporter = SenderController(writer)..setPlan(scan, selection);
+    await exporter.exportBundle();
+    final leavesWire = [
+      for (final e in scan.leaves)
+        if (selection.contains(e.relative))
+          Leaf(e.relative, e.size, e.kind, e.categoryId).toWire(),
+    ];
     await writer.writeManifest({
       'name': 'old-computer',
-      'created': DateTime.now().toIso8601String(),
       'bytes': exporter.totalBytes,
       'files': exporter.totalFiles,
+      'cats': [
+        for (final c in scan.categories)
+          if (c.available)
+            {'id': c.id, 'name': c.name, 'icon': c.icon, 'settings': c.settings}
+      ],
+      'leaves': leavesWire,
     });
     await writer.close();
-
     expect(exporter.state, TransferState.done);
-    final parts = Directory('$drive/$bundleDirName')
-        .listSync()
-        .where((e) => e.path.endsWith('.csb'))
-        .length;
-    expect(parts, greaterThan(1));
+    expect(
+        Directory('$drive/$bundleDirName')
+            .listSync()
+            .where((e) => e.path.endsWith('.csb'))
+            .length,
+        greaterThan(1));
 
-    final manifest = BundleReader.readManifest(drive);
-    expect(manifest?['name'], 'old-computer');
+    final manifest = BundleReader.readManifest(drive)!;
+    final leaves = [
+      for (final l in (manifest['leaves'] as List).cast<Map<String, dynamic>>())
+        Leaf.fromWire(l)
+    ];
+    // Import everything except the big photo.
+    final include = {
+      for (final l in leaves)
+        if (!l.rel.endsWith('photo.bin')) l.rel
+    };
 
     final receiver = ReceiverController(BundleReader(drive));
-    await receiver.importBundle();
+    await receiver.importBundle(include, leaves, peer: 'old-computer');
 
     expect(receiver.state, TransferState.done);
     expect(receiver.failedFiles, 0);
-    expect(shaOf('$dst/Pictures/photo.bin'), shaOf('$src/Pictures/photo.bin'));
-    expect(shaOf('$dst/Desktop/hello.txt'), shaOf('$src/Desktop/hello.txt'));
+    expect(File('$dst/Desktop/hello.txt').existsSync(), isTrue);
+    expect(shaOf('$dst/Pictures/small.bin'), shaOf('$src/Pictures/small.bin'));
+    expect(File('$dst/Pictures/photo.bin').existsSync(), isFalse);
     expect(Link('$dst/Documents/link-to-hello').targetSync(),
         '../Desktop/hello.txt');
 

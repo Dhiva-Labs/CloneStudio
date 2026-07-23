@@ -9,7 +9,7 @@ import '../core/pairing.dart';
 import '../models/wizard_state.dart';
 import '../widgets/common.dart';
 import 'connected_screen.dart';
-import 'scan_screen.dart';
+import 'receive_offer_screen.dart';
 
 /// OLD computer: start the TLS server + discovery responder, show the PIN,
 /// wait for the new computer to pair.
@@ -270,7 +270,7 @@ class _PinEntryScreenState extends State<PinEntryScreen> {
       widget.state.session = session;
       if (!mounted) return;
       Navigator.of(context).push(MaterialPageRoute(
-          builder: (_) => ScanScreen(state: widget.state, local: false)));
+          builder: (_) => ReceiveOfferScreen(state: widget.state)));
       setState(() {
         busy = false;
         _controller.clear();

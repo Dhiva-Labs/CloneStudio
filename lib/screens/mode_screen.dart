@@ -3,8 +3,8 @@ import 'package:flutter/material.dart';
 import '../models/wizard_state.dart';
 import '../theme.dart';
 import '../widgets/common.dart';
-import 'preflight_screen.dart';
-import 'selection_screen.dart';
+import 'file_tree_screen.dart';
+import 'transport_screen.dart';
 
 class ModeScreen extends StatelessWidget {
   const ModeScreen({super.key, required this.state});
@@ -16,9 +16,18 @@ class ModeScreen extends StatelessWidget {
       return;
     }
     state.applyMode(m);
-    final next = m == TransferMode.custom
-        ? SelectionScreen(state: state)
-        : PreflightScreen(state: state);
+    // Custom opens the full file tree; the presets go straight on to picking
+    // how to connect. Either way, selection happens before connecting.
+    final Widget next = m == TransferMode.custom
+        ? FileTreeScreen(
+            state: state,
+            title: 'Pick exactly what moves',
+            subtitle: 'Open any folder and tick files or whole folders.',
+            continueLabel: 'Next',
+            onContinue: (ctx, st) => Navigator.of(ctx).push(
+                MaterialPageRoute(builder: (_) => TransportScreen(state: st))),
+          )
+        : TransportScreen(state: state);
     Navigator.of(context).push(MaterialPageRoute(builder: (_) => next));
   }
 

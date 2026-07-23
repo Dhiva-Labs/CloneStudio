@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 import '../core/pairing.dart';
 import '../core/scanner.dart';
 import '../core/transfer.dart';
+import 'selection.dart';
 
 enum DeviceRole { oldDevice, newDevice }
 
@@ -26,7 +27,7 @@ extension TransferModeInfo on TransferMode {
         TransferMode.wholeDisk =>
           'Everything, including the operating system. The new machine becomes this machine.',
         TransferMode.custom =>
-          'Pick exactly what moves over, folder by folder.',
+          'Hand-pick exactly what moves over, file by file.',
       };
 }
 
@@ -42,8 +43,8 @@ class WizardState extends ChangeNotifier {
   ReceiverController? receiver; // new computer, network or bundle
   SenderController? exporter; // old computer, USB drive
 
-  List<ScanCategory> cats = [];
-  Set<String> selected = {};
+  ScanResult? scan; // OLD device: the local scan
+  SelectionModel? selection; // the active selection tree (source or review)
   String? drivePath;
 
   void setRole(DeviceRole r) {
@@ -56,47 +57,48 @@ class WizardState extends ChangeNotifier {
     notifyListeners();
   }
 
-  void applyMode(TransferMode m) {
-    mode = m;
-    if (m == TransferMode.safe) {
-      selected = {
-        for (final c in cats)
-          if (c.available && !c.settings) c.id
-      };
-    } else if (m == TransferMode.recommended) {
-      selected = {
-        for (final c in cats)
-          if (c.available) c.id
-      };
-    } else if (m == TransferMode.custom && selected.isEmpty) {
-      selected = {
-        for (final c in cats)
-          if (c.available) c.id
-      };
-    }
+  /// OLD device: build the browsable selection tree from the local scan.
+  void buildSelectionFromScan(ScanResult s) {
+    scan = s;
+    selection = SelectionModel(
+      s.categories,
+      [
+        for (final e in s.leaves)
+          Leaf(e.relative, e.size, e.kind, e.categoryId),
+      ],
+    );
     notifyListeners();
   }
 
-  int get selectedBytes => cats
-      .where((c) => selected.contains(c.id))
-      .fold(0, (s, c) => s + c.sizeBytes);
-
-  int bytesForMode(TransferMode m) => switch (m) {
-        TransferMode.safe => cats
-            .where((c) => c.available && !c.settings)
-            .fold(0, (s, c) => s + c.sizeBytes),
-        _ => cats
-            .where((c) => c.available)
-            .fold(0, (s, c) => s + c.sizeBytes),
-      };
-
-  void toggle(ScanCategory c) {
-    if (selected.contains(c.id)) {
-      selected.remove(c.id);
-    } else {
-      selected.add(c.id);
-    }
+  /// NEW device: build the review tree from what the source offered.
+  void buildSelectionFromOffer(List<ScanCategory> cats, List<Leaf> leaves) {
+    selection = SelectionModel(cats, leaves)..selectAll(true);
     notifyListeners();
+  }
+
+  void applyMode(TransferMode m) {
+    mode = m;
+    selection?.applyMode((cat) => switch (m) {
+          TransferMode.safe => !cat.settings,
+          _ => true,
+        });
+    notifyListeners();
+  }
+
+  int get selectedBytes => selection?.selectedBytes ?? 0;
+  int get selectedFiles => selection?.selectedFiles ?? 0;
+  Set<String> includedRels() => selection?.includedRels() ?? {};
+
+  /// Estimated size of a preset, straight from the category totals — used on
+  /// the mode cards before the tree is touched.
+  int bytesForMode(TransferMode m) {
+    final cats = scan?.categories ?? const <ScanCategory>[];
+    return switch (m) {
+      TransferMode.safe => cats
+          .where((c) => c.available && !c.settings)
+          .fold(0, (s, c) => s + c.sizeBytes),
+      _ => cats.where((c) => c.available).fold(0, (s, c) => s + c.sizeBytes),
+    };
   }
 
   /// Back to the first screen; closes any live connection.
@@ -106,8 +108,9 @@ class WizardState extends ChangeNotifier {
     sender = null;
     receiver = null;
     exporter = null;
-    cats = [];
-    selected = {};
+    scan = null;
+    selection = null;
+    drivePath = null;
     mode = null;
     transport = null;
     role = null;
@@ -122,5 +125,6 @@ String prettyBytes(int bytes) {
     return '${(bytes / gb).toStringAsFixed(bytes % gb == 0 ? 0 : 1)} GB';
   }
   if (bytes >= mb) return '${(bytes / mb).round()} MB';
-  return '${(bytes / 1024).round()} KB';
+  if (bytes >= 1024) return '${(bytes / 1024).round()} KB';
+  return '$bytes B';
 }

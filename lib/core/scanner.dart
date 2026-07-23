@@ -139,11 +139,16 @@ class ScanEntry {
   final String categoryId;
   final String absolute; // source path (or inline content for virtual)
   final String relative; // path under the target root
-  final String kind; // file | dir | symlink | virtual
+  final String kind; // file | dir | symlink | virtual | app
   final int size;
   final int mode; // unix permission bits
   String? linkTarget;
   List<int>? content; // virtual entries carry their bytes directly
+
+  // For kind 'app' — an installed application picked as a whole, reinstalled
+  // from a list on the new computer rather than copied file-by-file.
+  String? appManager; // apt | flatpak | snap
+  String? appId; // package name / application id
 }
 
 bool _isExcluded(String name) => _excluded.contains(name);
@@ -237,24 +242,44 @@ Future<List<ScanEntry>> _virtualEntries(ScanCategory c) async {
     return null;
   }
 
+  ScanEntry appEntry(String manager, String label, String id) => ScanEntry(
+        c.id,
+        '',
+        'Applications/$label/$id',
+        'app',
+        0,
+        0,
+      )
+        ..appManager = manager
+        ..appId = id;
+
   switch (c.id) {
     case 'apps':
+      // Each installed app is its own tickable item; the reinstall list is
+      // generated from whatever the user selects (see renderAppList).
       final apt = await run('apt-mark', ['showmanual']);
-      if (apt != null && apt.trim().isNotEmpty) {
-        await add('CloneStudio-Restore/packages/apt-manual.txt', apt);
+      if (apt != null) {
+        for (final line in apt.trim().split('\n')) {
+          final id = line.trim();
+          if (id.isNotEmpty) out.add(appEntry('apt', 'Apt packages', id));
+        }
       }
       final flatpak =
           await run('flatpak', ['list', '--app', '--columns=application']);
-      if (flatpak != null && flatpak.trim().isNotEmpty) {
-        await add('CloneStudio-Restore/packages/flatpak-apps.txt', flatpak);
+      if (flatpak != null) {
+        for (final line in flatpak.trim().split('\n')) {
+          final id = line.trim();
+          if (id.isNotEmpty) out.add(appEntry('flatpak', 'Flatpak apps', id));
+        }
       }
       final snap = await run('snap', ['list']);
-      if (snap != null && snap.trim().isNotEmpty) {
-        await add('CloneStudio-Restore/packages/snap-list.txt', snap);
-      }
-      if (out.isNotEmpty) {
-        await add('CloneStudio-Restore/packages/install_apps.sh',
-            _installScript());
+      if (snap != null) {
+        final lines = snap.trim().split('\n');
+        for (var i = 1; i < lines.length; i++) {
+          // "snap list" is a table; the first column is the snap name.
+          final name = lines[i].split(RegExp(r'\s+')).first.trim();
+          if (name.isNotEmpty) out.add(appEntry('snap', 'Snap apps', name));
+        }
       }
     case 'desktop-settings':
       final dconf = await run('dconf', ['dump', '/']);
@@ -287,10 +312,58 @@ fi
 echo "Done. Snap apps are listed in snap-list.txt — install the ones you use with: sudo snap install <name>"
 ''';
 
-/// Sizes every category (entry counts + byte totals). Reasonably fast:
-/// it walks the tree once per category.
-Future<List<ScanCategory>> scanAll() async {
+/// Turns the user's selected app entries into the reinstall files that ship
+/// under CloneStudio-Restore/packages/. Called at send time so the list
+/// reflects exactly what was ticked.
+List<ScanEntry> renderAppList(Iterable<ScanEntry> selectedApps) {
+  final apt = <String>[], flatpak = <String>[], snap = <String>[];
+  for (final a in selectedApps) {
+    final id = a.appId;
+    if (id == null) continue;
+    switch (a.appManager) {
+      case 'apt':
+        apt.add(id);
+      case 'flatpak':
+        flatpak.add(id);
+      case 'snap':
+        snap.add(id);
+    }
+  }
+
+  final out = <ScanEntry>[];
+  void add(String rel, String content) {
+    final bytes = utf8.encode(content);
+    out.add(ScanEntry('apps', '', rel, 'virtual', bytes.length, 420)
+      ..content = bytes);
+  }
+
+  const base = 'CloneStudio-Restore/packages';
+  if (apt.isNotEmpty) add('$base/apt-manual.txt', '${apt.join('\n')}\n');
+  if (flatpak.isNotEmpty) {
+    add('$base/flatpak-apps.txt', '${flatpak.join('\n')}\n');
+  }
+  if (snap.isNotEmpty) add('$base/snap-list.txt', '${snap.join('\n')}\n');
+  if (out.isNotEmpty) add('$base/install_apps.sh', _installScript());
+  return out;
+}
+
+/// A full source scan: categories sized up, plus every entry (dirs, files,
+/// symlinks, virtual) in walk order so the transfer engine and the file
+/// tree both work from one pass.
+class ScanResult {
+  ScanResult(this.categories, this.entries);
+  final List<ScanCategory> categories;
+  final List<ScanEntry> entries;
+
+  /// The selectable leaves (no directories) — what the file tree is built
+  /// from and what gets offered to the other computer.
+  List<ScanEntry> get leaves =>
+      [for (final e in entries) if (e.kind != 'dir') e];
+}
+
+Future<ScanResult> scanEverything() async {
   final cats = buildCategories();
+  final all = <ScanEntry>[];
   for (final c in cats) {
     final entries = await scanCategory(c);
     c.fileCount = entries.where((e) => e.kind != 'dir').length;
@@ -299,23 +372,18 @@ Future<List<ScanCategory>> scanAll() async {
       c.available = false;
       c.note = 'Nothing found here';
     }
-    if (c.id == 'apps' && c.fileCount > 0) {
-      // Show the package count, not the size of the text files.
-      final aptEntry = entries
-          .where((e) => e.relative.endsWith('apt-manual.txt'))
-          .toList();
-      if (aptEntry.isNotEmpty && aptEntry.first.content != null) {
-        final count = utf8
-            .decode(aptEntry.first.content!)
-            .trim()
-            .split('\n')
-            .length;
-        c.note = '$count apps';
-      }
+    if (c.id == 'apps') {
+      final count = entries.where((e) => e.kind == 'app').length;
+      c.available = count > 0;
+      c.note = count > 0 ? '$count apps' : 'Nothing found here';
     }
+    all.addAll(entries);
   }
-  return cats;
+  return ScanResult(cats, all);
 }
+
+/// Sizes every category (entry counts + byte totals).
+Future<List<ScanCategory>> scanAll() async => (await scanEverything()).categories;
 
 /// Free bytes on the filesystem holding [path].
 Future<int> freeBytes(String path) async {

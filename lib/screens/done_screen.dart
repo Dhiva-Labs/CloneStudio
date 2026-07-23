@@ -29,7 +29,10 @@ class DoneScreen extends StatelessWidget {
         ? 0
         : DateTime.now().difference(source.startedAt!).inMinutes;
     final tookText = mins < 1 ? 'under a minute' : '$mins min';
-    final hasApps = state.selected.contains('apps');
+    // The reinstall script actually landed on this computer.
+    final hasApps = File(
+            '${targetRoot()}/CloneStudio-Restore/packages/install_apps.sh')
+        .existsSync();
     final failed =
         source is ReceiverController ? (source as ReceiverController).failedFiles : 0;
 

@@ -2,9 +2,10 @@ import 'package:flutter/material.dart';
 
 import '../models/wizard_state.dart';
 import '../widgets/common.dart';
+import 'scan_screen.dart';
 import 'transport_screen.dart';
 
-const appVersion = '1.0.0';
+const appVersion = '1.1.0';
 
 class RoleScreen extends StatelessWidget {
   const RoleScreen({super.key, required this.state});
@@ -13,8 +14,12 @@ class RoleScreen extends StatelessWidget {
   void _pick(BuildContext context, DeviceRole role) {
     state.reset(); // a fresh journey; closes any leftover connection
     state.setRole(role);
-    Navigator.of(context).push(MaterialPageRoute(
-        builder: (_) => TransportScreen(state: state)));
+    // The OLD computer chooses what to move *before* connecting; the NEW
+    // computer just needs to know how to connect and then reviews the offer.
+    final next = role == DeviceRole.oldDevice
+        ? ScanScreen(state: state)
+        : TransportScreen(state: state);
+    Navigator.of(context).push(MaterialPageRoute(builder: (_) => next));
   }
 
   @override

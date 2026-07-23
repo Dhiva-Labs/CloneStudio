@@ -3,10 +3,13 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../core/bundle.dart';
+import '../core/scanner.dart';
 import '../core/transfer.dart';
+import '../models/selection.dart';
 import '../models/wizard_state.dart';
 import '../widgets/common.dart';
-import 'scan_screen.dart';
+import 'file_tree_screen.dart';
+import 'preflight_screen.dart';
 import 'transfer_screen.dart';
 
 /// USB-drive transport, wired to real mounts. The list refreshes every two
@@ -48,29 +51,65 @@ class _DriveScreenState extends State<DriveScreen> {
   }
 
   void _pickForExport(DriveLocation d) {
+    // Selection was already made before transport; go straight to the
+    // pre-flight checks, which run the export.
     widget.state.drivePath = d.path;
     Navigator.of(context).push(MaterialPageRoute(
-        builder: (_) => ScanScreen(state: widget.state, local: true)));
+        builder: (_) => PreflightScreen(state: widget.state)));
   }
 
   void _pickForImport(DriveLocation d) {
     final st = widget.state;
     st.drivePath = d.path;
-    final receiver = ReceiverController(BundleReader(d.path));
-    st.receiver = receiver;
-    // The manifest names what was exported, for the receipt totals.
     final manifest = BundleReader.readManifest(d.path);
-    st.selected = {'bundle'};
+    final peer = (manifest?['name'] as String?) ?? '';
+    final cats = _catsFromManifest(manifest);
+    final leaves = _leavesFromManifest(manifest);
+    st.buildSelectionFromOffer(cats, leaves);
+
+    final receiver = ReceiverController(BundleReader(d.path));
+    receiver.peerName = peer;
+    st.receiver = receiver;
+
     Navigator.of(context).push(MaterialPageRoute(
-        builder: (_) => TransferScreen(
-              state: st,
+      builder: (_) => FileTreeScreen(
+        state: st,
+        title: 'Review what’s on the drive',
+        subtitle:
+            'From ${peer.isEmpty ? 'the old computer' : peer}. Untick anything '
+            'you don’t want to restore here.',
+        continueLabel: 'Restore it',
+        onContinue: (ctx, s) {
+          Navigator.of(ctx).pushReplacement(MaterialPageRoute(
+            builder: (_) => TransferScreen(
+              state: s,
               source: receiver,
               sending: false,
-              starter: () => receiver.importBundle(),
-            )));
-    if (manifest != null) {
-      receiver.peerName = (manifest['name'] as String?) ?? '';
-    }
+              starter: () =>
+                  receiver.importBundle(s.includedRels(), leaves, peer: peer),
+            ),
+          ));
+        },
+      ),
+    ));
+  }
+
+  List<ScanCategory> _catsFromManifest(Map<String, dynamic>? m) {
+    final raw = (m?['cats'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+    return [
+      for (final c in raw)
+        ScanCategory(
+          id: c['id'] as String,
+          name: c['name'] as String,
+          icon: c['icon'] as String,
+          settings: c['settings'] as bool? ?? false,
+        )..available = true,
+    ];
+  }
+
+  List<Leaf> _leavesFromManifest(Map<String, dynamic>? m) {
+    final raw = (m?['leaves'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+    return [for (final l in raw) Leaf.fromWire(l)];
   }
 
   @override

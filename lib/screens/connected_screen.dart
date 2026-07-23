@@ -26,6 +26,7 @@ class _ConnectedScreenState extends State<ConnectedScreen> {
     super.initState();
     final session = widget.state.session!;
     sender = SenderController(session, session);
+    sender.setPlan(widget.state.scan!, widget.state.includedRels());
     widget.state.sender = sender;
     sender.addListener(_onChange);
     // After the first frame: serve() notifies listeners synchronously, which
@@ -99,7 +100,6 @@ class _ConnectedScreenState extends State<ConnectedScreen> {
           ),
         );
       default:
-        final scanning = sender.state == TransferState.scanning;
         return WizardScaffold(
           title: 'Connected! ✅',
           subtitle: 'The two computers are now securely linked.',
@@ -132,9 +132,9 @@ class _ConnectedScreenState extends State<ConnectedScreen> {
                           style: Theme.of(context).textTheme.titleLarge),
                       const SizedBox(height: 8),
                       Text(
-                        scanning
-                            ? 'Sizing up what can move over…'
-                            : 'Now choose what moves over — on the NEW computer.',
+                        'Waiting for the new computer to review what you '
+                        'picked…',
+                        textAlign: TextAlign.center,
                         style: Theme.of(context)
                             .textTheme
                             .bodyLarge
@@ -145,10 +145,8 @@ class _ConnectedScreenState extends State<ConnectedScreen> {
                                     ?.color
                                     ?.withValues(alpha: 0.6)),
                       ),
-                      if (scanning) ...[
-                        const SizedBox(height: 16),
-                        const LinearProgressIndicator(),
-                      ],
+                      const SizedBox(height: 16),
+                      const LinearProgressIndicator(),
                     ],
                   ),
                 ),

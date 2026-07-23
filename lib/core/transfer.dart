@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:crypto/crypto.dart' as crypto;
 import 'package:flutter/foundation.dart';
 
+import '../models/selection.dart';
 import 'journal.dart';
 import 'scanner.dart';
 import 'session.dart';
@@ -13,7 +14,7 @@ const _flushEvery = 8 * 1024 * 1024; // keep memory flat without stalling
 const _serveTimeout = Duration(days: 1); // humans pick modes slowly
 const _dataTimeout = Duration(seconds: 60);
 
-enum TransferState { idle, waiting, scanning, transferring, verifying, done, error }
+enum TransferState { idle, waiting, offering, transferring, verifying, done, error }
 
 /// Shared progress surface for every transfer UI (send, receive, export,
 /// import) so the screens don't care which side they're showing.
@@ -49,14 +50,14 @@ abstract class ProgressSource extends ChangeNotifier {
     notifyListeners();
   }
 
-  void _setState(TransferState s) {
+  void setState_(TransferState s) {
     state = s;
     notifyListeners();
   }
 
   void fail(String friendly) {
     errorMessage = friendly;
-    _setState(TransferState.error);
+    setState_(TransferState.error);
   }
 }
 
@@ -69,58 +70,81 @@ class _DigestSink implements Sink<crypto.Digest> {
 }
 
 /// OLD computer (or bundle exporter): walks the disk and streams entries.
+///
+/// The source pre-selects on its own screen; over the network it first
+/// *offers* that selection so the new computer can review and trim it, then
+/// streams only what the new computer confirms.
 class SenderController extends ProgressSource {
   SenderController(this.writer, [this.reader]);
 
   final WireWriter writer;
   final WireReader? reader; // null when writing a bundle (one-way)
 
-  List<ScanCategory>? _scanned;
+  List<ScanEntry> _entries = [];
+  Set<String> _selection = {}; // the source's own picks (rel paths of leaves)
+  List<ScanCategory> _cats = [];
 
-  /// Network mode: answer the new computer's requests until done.
-  Future<void> serve() async {
-    final r = reader!;
-    _setState(TransferState.waiting);
-    while (true) {
-      final msg = await r.readJson(timeout: _serveTimeout);
-      if (msg == null) {
-        if (state != TransferState.done) {
-          fail('The connection was lost. Open Clone Studio on both '
-              'computers to continue where you left off.');
-        }
-        return;
-      }
-      switch (msg['type']) {
-        case 'scan':
-          _setState(TransferState.scanning);
-          _scanned = await scanAll();
-          writer.sendJson({
-            'type': 'scan_result',
-            'name': Platform.localHostname,
-            'categories': [for (final c in _scanned!) c.toWire()],
-          });
-          await writer.flush();
-          _setState(TransferState.waiting);
-        case 'start':
-          final selected = (msg['selected'] as List).cast<String>();
-          final have = (msg['have'] as List? ?? [])
-              .cast<Map<String, dynamic>>();
-          await send(selected, have);
-          if (state == TransferState.error) return;
-          final ack = await r.readJson(timeout: _dataTimeout);
-          if (ack?['type'] == 'ack') _setState(TransferState.done);
-          return;
-      }
-    }
+  /// Called before serve()/exportBundle with the local scan + the user's
+  /// selection made on this computer.
+  void setPlan(ScanResult scan, Set<String> selectedRels) {
+    _entries = scan.entries;
+    _cats = scan.categories;
+    _selection = selectedRels;
   }
 
-  /// Streams the selected categories. Also used directly for bundle export.
-  /// Never throws on a lost pipe — the fail-safe promise is that both sides
-  /// end in a calm, resumable state.
-  Future<void> send(List<String> selected,
-      List<Map<String, dynamic>> have) async {
+  List<Map<String, dynamic>> _offerLeaves() => [
+        for (final e in _entries)
+          if (e.kind != 'dir' && _selection.contains(e.relative))
+            Leaf(e.relative, e.size, e.kind, e.categoryId).toWire(),
+      ];
+
+  List<Map<String, dynamic>> _offerCats() => [
+        for (final c in _cats)
+          if (c.available)
+            {'id': c.id, 'name': c.name, 'icon': c.icon, 'settings': c.settings},
+      ];
+
+  /// Network mode: offer the selection, wait for the trimmed confirmation,
+  /// then stream it.
+  Future<void> serve() async {
+    final r = reader!;
+    setState_(TransferState.offering);
     try {
-      await _send(selected, have);
+      writer.sendJson({
+        'type': 'offer',
+        'name': Platform.localHostname,
+        'cats': _offerCats(),
+        'leaves': _offerLeaves(),
+      });
+      await writer.flush();
+    } on SocketException {
+      fail('The connection was lost. Reopen Clone Studio on both computers.');
+      return;
+    }
+    setState_(TransferState.waiting);
+    final msg = await r.readJson(timeout: _serveTimeout);
+    if (msg == null || msg['type'] != 'start') {
+      fail('The other computer disconnected before choosing. Please try again.');
+      return;
+    }
+    final include = (msg['include'] as List).cast<String>().toSet();
+    final have = (msg['have'] as List? ?? []).cast<Map<String, dynamic>>();
+    await send(include, have);
+    if (state == TransferState.error) return;
+    final ack = await r.readJson(timeout: _dataTimeout);
+    if (ack?['type'] == 'ack') setState_(TransferState.done);
+  }
+
+  /// Bundle export: stream the source's whole selection into the drive; the
+  /// new computer trims it on import.
+  Future<void> exportBundle() => send(_selection, []);
+
+  /// Streams the [include] set (already a subset of the source's selection),
+  /// skipping anything the target reports it already [have]s. Never throws on
+  /// a lost pipe — both sides must end in a calm, resumable state.
+  Future<void> send(Set<String> include, List<Map<String, dynamic>> have) async {
+    try {
+      await _send(include, have);
     } on SocketException {
       fail('The connection was interrupted. Nothing is lost — reopen '
           'Clone Studio on both computers and it continues where it left off.');
@@ -130,20 +154,35 @@ class SenderController extends ProgressSource {
     }
   }
 
-  Future<void> _send(List<String> selected,
-      List<Map<String, dynamic>> have) async {
+  Future<void> _send(
+      Set<String> include, List<Map<String, dynamic>> have) async {
     final haveSet = {for (final h in have) '${h['p']}#${h['s']}'};
-    final cats = (_scanned ?? await scanAll())
-        .where((c) => selected.contains(c.id))
-        .toList();
 
-    // Enumerate first so the receiver gets honest totals.
-    final all = <ScanEntry>[];
-    for (final c in cats) {
-      all.addAll(await scanCategory(c));
+    // Directories that are ancestors of an included leaf must travel (for
+    // their permissions and to hold empty structure).
+    final ancestors = <String>{};
+    for (final rel in include) {
+      var i = rel.lastIndexOf('/');
+      while (i > 0) {
+        ancestors.add(rel.substring(0, i));
+        i = rel.lastIndexOf('/', i - 1);
+      }
     }
+
+    final seen = <String>{};
     final toSend = <ScanEntry>[];
-    for (final e in all) {
+    final selectedApps = <ScanEntry>[];
+    for (final e in _entries) {
+      if (!seen.add(e.relative)) continue; // dedup overlapping categories
+      if (e.kind == 'dir') {
+        if (ancestors.contains(e.relative)) toSend.add(e);
+        continue;
+      }
+      if (!include.contains(e.relative)) continue;
+      if (e.kind == 'app') {
+        selectedApps.add(e); // reinstalled from a list, not copied
+        continue;
+      }
       if ((e.kind == 'file' || e.kind == 'virtual') &&
           haveSet.contains('${e.relative}#${e.size}')) {
         skippedFiles++;
@@ -151,16 +190,27 @@ class SenderController extends ProgressSource {
       }
       toSend.add(e);
     }
+
+    // Selected apps become the generated reinstall files.
+    for (final v in renderAppList(selectedApps)) {
+      if (haveSet.contains('${v.relative}#${v.size}')) {
+        skippedFiles++;
+        continue;
+      }
+      toSend.add(v);
+    }
+
     totalFiles = toSend.where((e) => e.kind != 'dir').length;
     totalBytes = toSend.fold(0, (s, e) => s + e.size);
     startedAt = DateTime.now();
     writer.sendJson({
       'type': 'plan',
+      'name': Platform.localHostname,
       'files': totalFiles,
       'bytes': totalBytes,
       'skipped': skippedFiles,
     });
-    _setState(TransferState.transferring);
+    setState_(TransferState.transferring);
 
     for (final e in toSend) {
       currentItem = e.relative;
@@ -186,7 +236,7 @@ class SenderController extends ProgressSource {
       'skipped': skippedFiles,
     });
     await writer.flush();
-    if (reader == null) _setState(TransferState.done); // bundle export ends here
+    if (reader == null) setState_(TransferState.done); // bundle export ends here
   }
 
   Future<void> _sendBytes(String rel, int mode, List<int> content) async {
@@ -226,8 +276,6 @@ class SenderController extends ProgressSource {
     try {
       raf = await file.open();
     } catch (_) {
-      // Vanished or unreadable since scan: send empty + bad sha so the
-      // receiver discards it rather than trusting a half-truth.
       digestIn.close();
       writer.sendJson({'type': 'file_end', 'sha': 'unreadable'});
       return;
@@ -252,8 +300,6 @@ class SenderController extends ProgressSource {
     await writer.flush();
     await raf.close();
     if (remaining > 0) {
-      // File shrank while reading — pad protocol with zeros so framing
-      // survives, then poison the hash so the receiver drops it.
       while (remaining > 0) {
         final n = remaining < _chunkSize ? remaining : _chunkSize;
         writer.sendFrame(Uint8List(n));
@@ -270,62 +316,71 @@ class SenderController extends ProgressSource {
   }
 }
 
-/// NEW computer (or bundle importer): receives entries, writes atomically,
-/// journals progress, verifies at the end.
+/// NEW computer (or bundle importer): reviews the offer, then receives the
+/// confirmed set, writing atomically, journaling progress, verifying.
 class ReceiverController extends ProgressSource {
   ReceiverController(this.reader, [this.writer]);
 
   final WireReader reader;
   final WireWriter? writer; // null when importing from a bundle
 
-  List<ScanCategory> categories = [];
   String peerName = '';
+  List<ScanCategory> offerCats = [];
+  List<Leaf> offerLeaves = [];
+
   int failedFiles = 0;
   Journal? _journal;
+  Set<String>? _includeFilter; // bundle import: only write these
+  int? _plannedBytes; // bundle import: honest total after trimming
 
-  /// Network mode: ask the old computer to size everything up.
-  Future<bool> requestScan() async {
-    _setState(TransferState.scanning);
-    writer!.sendJson({'type': 'scan'});
-    await writer!.flush();
-    final msg =
-        await reader.readJson(timeout: const Duration(minutes: 10));
-    if (msg == null || msg['type'] != 'scan_result') {
-      fail("The old computer didn't answer. Check it's still on and try again.");
+  /// Network mode: read the source's offer so the review screen can build a
+  /// selection tree from it.
+  Future<bool> receiveOffer() async {
+    setState_(TransferState.offering);
+    final msg = await reader.readJson(timeout: const Duration(minutes: 10));
+    if (msg == null || msg['type'] != 'offer') {
+      fail("The old computer didn't send anything. Check it's still on and "
+          'try again.');
       return false;
     }
     peerName = (msg['name'] as String?) ?? '';
-    categories = [
-      for (final w in (msg['categories'] as List).cast<Map<String, dynamic>>())
+    offerCats = [
+      for (final w in (msg['cats'] as List).cast<Map<String, dynamic>>())
         ScanCategory(
           id: w['id'] as String,
           name: w['name'] as String,
           icon: w['icon'] as String,
           settings: w['settings'] as bool? ?? false,
-        )
-          ..sizeBytes = w['size'] as int
-          ..fileCount = w['files'] as int
-          ..available = w['available'] as bool? ?? true
-          ..note = w['note'] as String?,
+        )..available = true,
     ];
-    _setState(TransferState.idle);
+    offerLeaves = [
+      for (final w in (msg['leaves'] as List).cast<Map<String, dynamic>>())
+        Leaf.fromWire(w),
+    ];
+    setState_(TransferState.idle);
     return true;
   }
 
-  /// Network mode: kick off the transfer for the chosen categories.
-  Future<void> start(List<String> selectedIds) async {
+  /// Network mode: confirm the trimmed [include] set and receive it.
+  Future<void> startReceive(Set<String> include) async {
     _journal = await Journal.open(targetRoot());
     writer!.sendJson({
       'type': 'start',
-      'selected': selectedIds,
+      'include': include.toList(),
       'have': _journal!.toHave(targetRoot()),
     });
     await writer!.flush();
     await _receiveLoop();
   }
 
-  /// Bundle mode: the whole conversation is already in the files.
-  Future<void> importBundle() async {
+  /// Bundle mode: [include] filters which files from the bundle to restore.
+  Future<void> importBundle(Set<String> include, List<Leaf> manifestLeaves,
+      {String peer = ''}) async {
+    peerName = peer;
+    _includeFilter = include;
+    _plannedBytes = manifestLeaves
+        .where((l) => include.contains(l.rel))
+        .fold<int>(0, (s, l) => s + l.size);
     _journal = await Journal.open(targetRoot());
     await _receiveLoop();
   }
@@ -341,7 +396,7 @@ class ReceiverController extends ProgressSource {
   Future<void> _receiveLoopInner() async {
     final root = targetRoot();
     final journal = _journal!;
-    _setState(TransferState.transferring);
+    setState_(TransferState.transferring);
     startedAt = DateTime.now();
 
     while (true) {
@@ -356,12 +411,21 @@ class ReceiverController extends ProgressSource {
       switch (msg['type']) {
         case 'plan':
           totalFiles = msg['files'] as int;
-          totalBytes = msg['bytes'] as int;
-          skippedFiles = msg['skipped'] as int? ?? 0;
+          totalBytes = _plannedBytes ?? msg['bytes'] as int;
+          skippedFiles = msg['skipped'] as int? ?? 0; // resume skips
+          if (peerName.isEmpty) peerName = (msg['name'] as String?) ?? '';
+          // Guard the target's disk before we start writing.
+          final need = _plannedBytes ?? (msg['bytes'] as int);
+          final free = await freeBytes(root);
+          if (free < need + (need ~/ 20)) {
+            fail('Not enough space on this computer. This needs '
+                '${_fmtGb(need)} but only ${_fmtGb(free)} is free. '
+                'Free up some space, or go back and pick fewer files.');
+            return;
+          }
           notifyListeners();
         case 'dir':
-          final dir = Directory('$root/${msg['p']}');
-          await dir.create(recursive: true);
+          await Directory('$root/${msg['p']}').create(recursive: true);
         case 'symlink':
           final path = '$root/${msg['p']}';
           try {
@@ -375,11 +439,11 @@ class ReceiverController extends ProgressSource {
           await _receiveFile(root, journal, msg);
         case 'complete':
           await journal.save();
-          _setState(TransferState.verifying);
+          setState_(TransferState.verifying);
           await _verify(root, journal);
           writer?.sendJson({'type': 'ack'});
           await writer?.flush();
-          _setState(TransferState.done);
+          setState_(TransferState.done);
           return;
       }
     }
@@ -393,10 +457,15 @@ class ReceiverController extends ProgressSource {
     final mtime = msg['mtime'] as int?;
     currentItem = rel;
 
-    final alreadyHave = journal.has(rel, size) && File('$root/$rel').existsSync();
+    final trimmedOut = _includeFilter != null && !_includeFilter!.contains(rel);
+    final alreadyHave =
+        journal.has(rel, size) && File('$root/$rel').existsSync();
+    // "consume without writing": bundle files the user unticked, or files a
+    // resume already completed.
+    final skip = trimmedOut || alreadyHave;
 
     var dest = '$root/$rel';
-    if (!alreadyHave && File(dest).existsSync()) {
+    if (!skip && File(dest).existsSync()) {
       dest = _keepBothPath(dest); // never silently overwrite what was there
     }
 
@@ -404,7 +473,7 @@ class ReceiverController extends ProgressSource {
     final digestIn = crypto.sha256.startChunkedConversion(digestOut);
     RandomAccessFile? raf;
     File? partial;
-    if (!alreadyHave) {
+    if (!skip) {
       partial = File('$dest.partial');
       await partial.parent.create(recursive: true);
       raf = await partial.open(mode: FileMode.write);
@@ -432,9 +501,9 @@ class ReceiverController extends ProgressSource {
     final wantSha = end?['sha'] as String?;
     final gotSha = digestOut.value?.toString() ?? '';
 
-    if (alreadyHave) {
+    if (skip) {
       doneFiles++;
-      return; // consumed and discarded — resume skip for bundle imports
+      return;
     }
 
     if (end == null || end['type'] != 'file_end' || wantSha != gotSha) {
@@ -479,8 +548,6 @@ class ReceiverController extends ProgressSource {
     return candidate;
   }
 
-  /// Quick end-of-run audit: everything journaled must exist with the
-  /// right size.
   Future<void> _verify(String root, Journal journal) async {
     for (final e in journal.done.entries) {
       final f = File('$root/${e.key}');
@@ -495,4 +562,11 @@ class ReceiverController extends ProgressSource {
 
 class _Interrupted implements Exception {
   const _Interrupted();
+}
+
+String _fmtGb(int bytes) {
+  const gb = 1024 * 1024 * 1024;
+  const mb = 1024 * 1024;
+  if (bytes >= gb) return '${(bytes / gb).toStringAsFixed(1)} GB';
+  return '${(bytes / mb).round()} MB';
 }
