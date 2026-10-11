@@ -1,0 +1,20 @@
+#!/bin/sh
+# Clone Studio snap shim for `flatpak list --app --columns=application`.
+#
+# The flatpak CLI is not in the snap, and the host's system installation is
+# only visible read-only under /var/lib/snapd/hostfs (via the
+# `host-packages` system-files plug). An app is installed when its
+# directory has an active `current` deployment. User installations live
+# under ~/.local/share/flatpak, reached through the `app-settings` plug.
+if [ "$1" != list ]; then
+  echo "flatpak: only 'list --app' is available inside the Clone Studio snap" >&2
+  exit 64
+fi
+for dir in /var/lib/snapd/hostfs/var/lib/flatpak/app \
+    "${SNAP_REAL_HOME:-$HOME}/.local/share/flatpak/app"; do
+  [ -d "$dir" ] || continue
+  for app in "$dir"/*; do
+    [ -e "$app/current" ] && basename "$app"
+  done
+done | sort -u
+exit 0

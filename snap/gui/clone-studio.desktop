@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Clone Studio
+Comment=Move everything to your new Linux computer - safely, step by step
+Exec=clone-studio
+Icon=${SNAP}/usr/share/icons/hicolor/256x256/apps/clone-studio.png
+Terminal=false
+Categories=Utility;System;
+Keywords=migration;transfer;backup;clone;move;
+StartupWMClass=com.dhivalabs.clone_studio

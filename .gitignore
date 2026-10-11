@@ -46,3 +46,6 @@ app.*.map.json
 
 # Release artifacts
 dist/
+
+# Snap packages built by snapcraft
+*.snap

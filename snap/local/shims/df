@@ -1,0 +1,11 @@
+#!/bin/sh
+# Clone Studio snap shim for `df -B1 --output=avail PATH`.
+#
+# core22's df is not on the AppArmor template's allow-list, and a staged
+# copy cannot read /proc/self/mountinfo (explicitly denied), so free space
+# is computed with `stat -f`, which only needs statfs(2) on the path itself.
+# Prints the same two lines as the real command: a header, then bytes.
+for path; do :; done
+set -- $(stat -f -c '%a %S' "${path:-.}") || exit 1
+echo Avail
+echo $(( $1 * $2 ))

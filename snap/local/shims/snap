@@ -1,0 +1,16 @@
+#!/bin/sh
+# Clone Studio snap shim for `snap list`.
+#
+# A confined snap may not talk to snapd, so the real `snap list` fails. The
+# directory of snap desktop launchers is readable (desktop interfaces), and
+# each entry is named <snap>_<app>.desktop, so this lists every installed
+# snap that has a launcher - the graphical apps a user would want to move.
+# Bases, runtimes and command-line-only snaps are not listed. Output keeps
+# the shape of `snap list`: a header line, then the name in column one.
+if [ "$1" != list ]; then
+  echo "snap: only 'list' is available inside the Clone Studio snap" >&2
+  exit 64
+fi
+echo "Name"
+ls /var/lib/snapd/desktop/applications/ 2>/dev/null |
+  sed -n 's/^\([a-z0-9-]*\)[_+].*\.desktop$/\1/p' | sort -u

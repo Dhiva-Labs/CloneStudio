@@ -1,0 +1,234 @@
+# Snap Store packaging for Clone Studio.
+#
+# Same shape as BranchPilot's snap: `plugin: flutter` + the `gnome`
+# extension under strict confinement, built from source in a core22
+# container so the binary matches the snap's runtime libraries.
+#
+# See packaging/SNAP.md for the build and publish procedure, why this is
+# strict rather than classic, and exactly what confinement costs.
+name: clone-studio
+title: Clone Studio
+base: core22
+version: '1.1.0'
+summary: Move everything to your new Linux computer over Wi-Fi, cable or USB
+description: |
+  Clone Studio is a beginner-proof migration assistant for Linux laptops and
+  desktops. Run it on both computers, say which one is old and which one is
+  new, and it moves your files, apps and settings across - over Wi-Fi, a
+  direct network cable, or a USB drive. Nothing ever touches the internet.
+
+  * Selection first: choose what moves before connecting - personal
+    folders, app settings, browser profiles, SSH keys, desktop look & feel
+    and your installed apps - down to individual files.
+  * Secure: TLS-encrypted transfers with a 6-digit pairing code that is
+    bound to the connection, so a man-in-the-middle is rejected.
+  * Fail-safe: every finished file is journaled and written atomically; a
+    dropped connection or a reboot resumes where it left off, and files
+    already on the new computer are never overwritten.
+  * Apps: your installed apps come over as a list plus a one-command
+    reinstall script.
+
+  This snap is strictly confined. Your personal folders work out of the
+  box; everything else is a connection to make once, on both computers,
+  before you start (transfer-journal is required on the new computer):
+
+    sudo snap connect clone-studio:transfer-journal   # needed to receive
+    sudo snap connect clone-studio:app-settings       # ~/.config, dotfiles
+    sudo snap connect clone-studio:browser-profiles   # Firefox, Chrome...
+    sudo snap connect clone-studio:ssh-folder         # ~/.ssh
+    sudo snap connect clone-studio:removable-media    # USB drive transport
+    sudo snap connect clone-studio:host-packages      # apt/flatpak app list
+
+  Differences from the .deb: the reinstall script runs outside the snap, so
+  on the new computer open a terminal and run
+  bash ~/CloneStudio-Restore/packages/install_apps.sh ; snaps are listed
+  when they have an app launcher; scheduled tasks (crontab) cannot be read.
+
+  A Dhiva Labs project.
+
+grade: stable
+confinement: strict
+icon: snap/gui/clone-studio.png
+license: MIT
+website: https://github.com/Dhiva-Labs/CloneStudio
+source-code: https://github.com/Dhiva-Labs/CloneStudio
+issues: https://github.com/Dhiva-Labs/CloneStudio/issues
+contact: dhivakar1010@gmail.com
+
+architectures:
+  - build-on: amd64
+
+plugs:
+  # Strict confinement's `home` interface covers non-hidden files only.
+  # Everything Clone Studio moves that lives in a hidden path is requested
+  # here through personal-files, one plug per category in the app so each
+  # can be granted (and connected) independently. All of these need a
+  # store declaration; see packaging/SNAP.md.
+
+  # The receiver's resume journal, $HOME/.clone-studio/journal.json. Without
+  # it a receive cannot record progress and stops, so this one is required
+  # on the NEW computer.
+  transfer-journal:
+    interface: personal-files
+    write:
+      - $HOME/.clone-studio
+
+  # "App settings & dotfiles": read on the old computer, restored on the new.
+  # personal-files grants a directory with everything below it, but a file
+  # only by its exact name. The receiver writes each file to "<name>.partial"
+  # and renames it into place, and when the new computer already has the
+  # file (it always has .bashrc and .profile) it keeps both by writing
+  # "<name> (from old computer)" instead - so each top-level dotfile needs
+  # all four names.
+  app-settings:
+    interface: personal-files
+    write:
+      - $HOME/.config
+      - $HOME/.local/share
+      - $HOME/.bashrc
+      - $HOME/.bashrc.partial
+      - $HOME/.bashrc (from old computer)
+      - $HOME/.bashrc (from old computer).partial
+      - $HOME/.zshrc
+      - $HOME/.zshrc.partial
+      - $HOME/.zshrc (from old computer)
+      - $HOME/.zshrc (from old computer).partial
+      - $HOME/.profile
+      - $HOME/.profile.partial
+      - $HOME/.profile (from old computer)
+      - $HOME/.profile (from old computer).partial
+      - $HOME/.gitconfig
+      - $HOME/.gitconfig.partial
+      - $HOME/.gitconfig (from old computer)
+      - $HOME/.gitconfig (from old computer).partial
+      - $HOME/.vimrc
+      - $HOME/.vimrc.partial
+      - $HOME/.vimrc (from old computer)
+      - $HOME/.vimrc (from old computer).partial
+
+  # "Browser profiles". Chrome-family profiles live under ~/.config and are
+  # listed here as well, so this category works without app-settings.
+  browser-profiles:
+    interface: personal-files
+    write:
+      - $HOME/.mozilla
+      - $HOME/.config/google-chrome
+      - $HOME/.config/chromium
+      - $HOME/.config/BraveSoftware
+
+  # "SSH keys": the stock ssh-keys interface is read-only, but the new
+  # computer has to write ~/.ssh.
+  ssh-folder:
+    interface: personal-files
+    write:
+      - $HOME/.ssh
+
+  # "Applications": the host's package databases, read-only. Inside the snap
+  # /var/lib/dpkg belongs to the core22 base, so the app's `apt-mark
+  # showmanual` and `flatpak list` calls are answered by shims (snap/local/
+  # shims) that read the host's state through /var/lib/snapd/hostfs.
+  host-packages:
+    interface: system-files
+    read:
+      - /var/lib/snapd/hostfs/var/lib/dpkg/status
+      - /var/lib/snapd/hostfs/var/lib/apt/extended_states
+      - /var/lib/snapd/hostfs/var/lib/flatpak/app
+
+apps:
+  clone-studio:
+    command: clone_studio
+    # The `gnome` extension supplies GTK and the `desktop-launch`
+    # command-chain wrapper, and injects the desktop, desktop-legacy,
+    # gsettings, opengl, wayland and x11 plugs.
+    extensions:
+      - gnome
+    desktop: usr/share/applications/clone-studio.desktop
+    environment:
+      # Inside a snap $HOME is ~/snap/clone-studio/<rev>. Clone Studio scans
+      # and restores relative to $HOME unless these (documented) overrides
+      # are set, so point both at the user's real home. The app's own TLS
+      # identity still lives under the snap's $HOME, which is what we want.
+      CLONE_STUDIO_SOURCE_ROOT: $SNAP_REAL_HOME
+      CLONE_STUDIO_TARGET_ROOT: $SNAP_REAL_HOME
+      # The app shells out to apt-mark, flatpak, snap and df by name. The
+      # shims answer exactly the queries it makes from what a confined snap
+      # can see; they must come first on PATH.
+      PATH: $SNAP/shims:$PATH
+    plugs:
+      - home
+      - network
+      - network-bind
+      - removable-media
+      - desktop
+      - desktop-legacy
+      - wayland
+      - x11
+      - unity7
+      - gsettings
+      - transfer-journal
+      - app-settings
+      - browser-profiles
+      - ssh-folder
+      - host-packages
+
+parts:
+  clone-studio:
+    plugin: flutter
+    source: .
+    flutter-target: lib/main.dart
+    # `source: .` copies the working tree verbatim. A build/ directory left
+    # by a host-side `flutter build linux` carries a CMakeCache.txt naming
+    # host paths, and CMake refuses to reuse a cache generated elsewhere.
+    override-pull: |
+      craftctl default
+      rm -rf build .dart_tool .flutter .pub-cache dist parts prime stage \
+        linux/flutter/ephemeral
+    build-packages:
+      - clang
+      - cmake
+      - ninja-build
+      - pkg-config
+      - libgtk-3-dev
+      - liblzma-dev
+      - libjsoncpp-dev
+      - curl
+      - unzip
+      - xz-utils
+      - git
+    # No stage-packages: GTK, GLib, the X11/Wayland client libraries and
+    # Mesa all come from the gnome-42-2204 content snap. Staging libgtk-3-0
+    # from the archive puts older copies of those ahead of the content snap
+    # on LD_LIBRARY_PATH; EGL then fails to initialise, Flutter cannot
+    # create a rendering surface and the window never appears.
+
+  host-tools:
+    # External programs the app runs that core22 lacks. Only the binary is
+    # kept: its libraries come from the gnome platform snap. openssl (device
+    # identity) and chmod come from core22 and are on the AppArmor
+    # template's allow-list.
+    plugin: nil
+    stage-packages:
+      # "Desktop look & feel" is captured with `dconf dump /`. The gnome
+      # extension's launcher symlinks the user's real dconf database into
+      # the snap's config directory and the gsettings plug allows reading it.
+      - dconf-cli
+    stage:
+      - usr/bin/dconf
+
+  shims:
+    # apt-mark, flatpak, snap and df stand-ins; see each script's header.
+    plugin: dump
+    source: snap/local
+    stage:
+      - shims/*
+
+  desktop-assets:
+    # The same launcher entry and icon the Debian package installs.
+    plugin: dump
+    source: snap/gui
+    organize:
+      clone-studio.desktop: usr/share/applications/clone-studio.desktop
+      clone-studio.png: usr/share/icons/hicolor/256x256/apps/clone-studio.png
+    stage:
+      - usr/share/applications/clone-studio.desktop
+      - usr/share/icons/hicolor/256x256/apps/clone-studio.png
