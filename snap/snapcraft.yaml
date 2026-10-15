@@ -56,7 +56,8 @@ issues: https://github.com/Dhiva-Labs/CloneStudio/issues
 contact: dhivakar1010@gmail.com
 
 architectures:
-  - build-on: amd64
+  - build-on: [amd64]
+  - build-on: [arm64]
 
 plugs:
   # Strict confinement's `home` interface covers non-hidden files only.
