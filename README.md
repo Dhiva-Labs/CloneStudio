@@ -1,5 +1,8 @@
 # Clone Studio
 
+[![ARM64 builds](https://github.com/Dhiva-Labs/CloneStudio/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Dhiva-Labs/CloneStudio/actions/workflows/ci.yml)
+![Linux x64 | arm64](https://img.shields.io/badge/Linux-x64%20%7C%20arm64-informational?logo=linux&logoColor=white)
+
 Move everything to your new Linux computer — safely, step by step.
 
 Clone Studio is a beginner-proof migration assistant for Linux laptops and
@@ -30,11 +33,26 @@ touches the internet.
 
 ## Install
 
+Download the `.deb` for your computer from the
+[releases page](https://github.com/Dhiva-Labs/CloneStudio/releases):
+`clone-studio_<version>_amd64.deb` for Intel / AMD, or
+`clone-studio_<version>_arm64.deb` for ARM. Then:
+
 ```bash
-sudo apt install ./clone-studio_1.0.0_amd64.deb
+sudo apt install ./clone-studio_*_$(dpkg --print-architecture).deb
 ```
 
 Or run from source: `flutter run -d linux` (Flutter 3.44+).
+
+To build the package yourself:
+
+```bash
+flutter build linux --release
+packaging/build_deb.sh          # writes dist/clone-studio_<version>_<arch>.deb
+```
+
+The package is built for the architecture of the machine it runs on: `amd64`
+on an x64 machine and `arm64` on an arm64 one.
 
 ## Development
 

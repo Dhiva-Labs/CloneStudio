@@ -252,7 +252,10 @@ snapcraft pack --use-lxd
 ```
 
 Produces `clone-studio_1.1.0_amd64.snap` in the repository root (ignored by
-git). The Flutter part's `override-pull` deletes any host `build/`, because
+git). Run on an arm64 machine it produces `clone-studio_1.1.0_arm64.snap`
+instead: `architectures:` in `snap/snapcraft.yaml` builds on each architecture
+it runs on. CI builds both and keeps them as workflow artifacts; it never
+uploads to the Store. The Flutter part's `override-pull` deletes any host `build/`, because
 its CMakeCache.txt names host paths and CMake refuses to reuse it.
 
 **Do not add `libgtk-3-0` to stage-packages** (BranchPilot's snap does).
@@ -294,6 +297,7 @@ locally; the store's declaration only governs store installs.)
 
 ```bash
 snapcraft upload --release=stable clone-studio_1.1.0_amd64.snap
+snapcraft upload --release=stable clone-studio_1.1.0_arm64.snap   # the arm64 build
 snapcraft revisions clone-studio
 snapcraft status clone-studio
 ```
