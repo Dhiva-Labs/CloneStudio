@@ -251,8 +251,8 @@ Post in the forum's **store-requests** category
 snapcraft pack --use-lxd
 ```
 
-Produces `clone-studio_1.1.0_amd64.snap` in the repository root (ignored by
-git). Run on an arm64 machine it produces `clone-studio_1.1.0_arm64.snap`
+Produces `clone-studio_1.1.1_amd64.snap` in the repository root (ignored by
+git). Run on an arm64 machine it produces `clone-studio_1.1.1_arm64.snap`
 instead: `architectures:` in `snap/snapcraft.yaml` builds on each architecture
 it runs on. CI builds both and keeps them as workflow artifacts; it never
 uploads to the Store. The Flutter part's `override-pull` deletes any host `build/`, because
@@ -282,7 +282,7 @@ Known build stalls, from this and other Dhiva Labs snaps:
 ## Smoke test before uploading
 
 ```bash
-sudo snap install --dangerous ./clone-studio_1.1.0_amd64.snap
+sudo snap install --dangerous ./clone-studio_1.1.1_amd64.snap
 for p in transfer-journal app-settings browser-profiles ssh-folder \
          removable-media host-packages; do
   sudo snap connect clone-studio:$p
@@ -296,8 +296,8 @@ locally; the store's declaration only governs store installs.)
 ## Uploading
 
 ```bash
-snapcraft upload --release=stable clone-studio_1.1.0_amd64.snap
-snapcraft upload --release=stable clone-studio_1.1.0_arm64.snap   # the arm64 build
+snapcraft upload --release=stable clone-studio_1.1.1_amd64.snap
+snapcraft upload --release=stable clone-studio_1.1.1_arm64.snap   # the arm64 build
 snapcraft revisions clone-studio
 snapcraft status clone-studio
 ```
