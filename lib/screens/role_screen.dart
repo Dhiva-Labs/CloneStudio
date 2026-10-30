@@ -5,7 +5,7 @@ import '../widgets/common.dart';
 import 'scan_screen.dart';
 import 'transport_screen.dart';
 
-const appVersion = '1.1.0';
+const appVersion = '1.1.1';
 
 class RoleScreen extends StatelessWidget {
   const RoleScreen({super.key, required this.state});

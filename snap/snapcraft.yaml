@@ -9,7 +9,7 @@
 name: clone-studio
 title: Clone Studio
 base: core22
-version: '1.1.0'
+version: '1.1.1'
 summary: Move everything to your new Linux computer over Wi-Fi, cable or USB
 description: |
   Clone Studio is a beginner-proof migration assistant for Linux laptops and
