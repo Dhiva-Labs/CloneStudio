@@ -1,12 +1,15 @@
 name: CI
 
-# Builds, tests and packages Clone Studio for Linux x64 and Linux arm64.
+# Builds, tests and packages Clone Studio for Linux x64 and Linux arm64: the
+# .deb and snap, and from the same build an .rpm (Fedora, RHEL, openSUSE), an
+# Arch package, an AUR PKGBUILD, an AppImage and a Flatpak bundle.
 #
 # Releases are made by hand and carry the .deb. When a release is published
 # (or this workflow is run by hand with release_tag set), the release job
-# attaches the .deb of every architecture built here, x64 and arm64, and
-# skips any file the release already has, so hand-made assets win. The snap
-# is a workflow artifact only: nothing is uploaded to the Snap Store.
+# attaches every package of every architecture built here, x64 and arm64,
+# except the snap, and skips any file the release already has, so hand-made
+# assets win. The snap is a workflow artifact only: nothing is uploaded to
+# the Snap Store.
 
 on:
   push:
@@ -15,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Existing release to attach the missing .deb files to, for example v1.1.0. Leave empty for a plain CI run.'
+        description: 'Existing release to attach the missing package files to, for example v1.1.0. Leave empty for a plain CI run.'
         required: false
         default: ''
   release:
@@ -171,6 +174,236 @@ jobs:
           path: ${{ runner.temp }}/smoke.png
           if-no-files-found: ignore
 
+  # Repackages each architecture's .deb for Fedora/RHEL/openSUSE (.rpm),
+  # Arch (.pkg.tar.zst) and any glibc distribution (AppImage), so every format
+  # ships the binary tested above. Each one is then installed on the real
+  # distribution and run there (packaging/linux-distros/verify.sh): the
+  # package manager must resolve its libraries and openssl, ldd must find
+  # every library, that openssl must make the app's TLS identity, and
+  # smoke.sh must see a painted UI.
+  distros:
+    name: Other distros ${{ matrix.arch }}
+    needs: [linux]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64, deb_arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, deb_arch: arm64, runner: ubuntu-24.04-arm }
+    env:
+      NFPM_VERSION: '2.48.0'
+      APPIMAGETOOL_VERSION: '1.9.1'
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-${{ matrix.arch }}
+          path: deb
+
+      - name: Install nfpm and appimagetool
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$(uname -m)" in
+            x86_64) nfpm_arch=x86_64; ai_arch=x86_64 ;;
+            aarch64) nfpm_arch=arm64; ai_arch=aarch64 ;;
+          esac
+          mkdir -p "$RUNNER_TEMP/bin"
+          cd "$RUNNER_TEMP/bin"
+          tarball="nfpm_${NFPM_VERSION}_Linux_${nfpm_arch}.tar.gz"
+          gh release download "v$NFPM_VERSION" -R goreleaser/nfpm -p "$tarball" -p checksums.txt
+          grep " $tarball\$" checksums.txt | sha256sum -c -
+          tar -xzf "$tarball" nfpm
+          gh release download "$APPIMAGETOOL_VERSION" -R AppImage/appimagetool \
+            -p "appimagetool-$ai_arch.AppImage" -O appimagetool
+          chmod +x appimagetool
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Build .rpm, Arch package and AppImage
+        run: |
+          VERSION="$(grep '^version:' pubspec.yaml | awk '{print $2}' | cut -d+ -f1)"
+          dpkg-deb -x "deb/clone-studio_${VERSION}_${{ matrix.deb_arch }}.deb" "$RUNNER_TEMP/root"
+          VERSION="$VERSION" packaging/linux-distros/pack.sh "$RUNNER_TEMP/root" ${{ matrix.deb_arch }} dist
+          # The Flatpak job builds from the same tree; tar keeps modes and symlinks.
+          tar -C "$RUNNER_TEMP/root" -cJf "$RUNNER_TEMP/tree.tar.xz" .
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tree-${{ matrix.arch }}
+          path: ${{ runner.temp }}/tree.tar.xz
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Install and run on Fedora, openSUSE and Arch
+        run: packaging/linux-distros/verify.sh dist ${{ matrix.deb_arch }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: distros-${{ matrix.arch }}
+          path: |
+            dist/*.rpm
+            dist/*.pkg.tar.zst
+            dist/*.AppImage
+          if-no-files-found: error
+
+  # AUR recipe: PKGBUILD + .SRCINFO for clone-studio-bin, rendered with the
+  # checksums of the .debs built above and proven with makepkg and an
+  # install on archlinux:latest. Pushing it to the AUR is a manual step.
+  aur:
+    name: AUR PKGBUILD
+    needs: [linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: 'linux-*'
+          path: debs
+          merge-multiple: true
+
+      - name: Render and check the PKGBUILD
+        run: |
+          VERSION="$(grep '^version:' pubspec.yaml | awk '{print $2}' | cut -d+ -f1)"
+          VERSION="$VERSION" packaging/arch/aur.sh \
+            "debs/clone-studio_${VERSION}_amd64.deb" "debs/clone-studio_${VERSION}_arm64.deb" dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: aur
+          path: dist/*-aur.tar.gz
+          if-no-files-found: error
+
+  # The Flatpak, built from the same installed tree in the Flathub builder
+  # image. The next job tests the bundle.
+  flatpak:
+    name: Flatpak ${{ matrix.arch }}
+    needs: [distros]
+    # It only needs the tree, which distros uploads before its distribution
+    # checks, so a Flatpak problem shows in the same run as a failed check.
+    if: ${{ !cancelled() && needs.distros.result != 'skipped' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-51
+      options: --privileged
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64, fp_arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: arm64, fp_arch: aarch64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: tree-${{ matrix.arch }}
+          path: ${{ runner.temp }}
+
+      - name: Unpack the installed tree
+        id: v
+        run: |
+          mkdir -p packaging/flatpak/tree
+          tar -xJf "$RUNNER_TEMP/tree.tar.xz" -C packaging/flatpak/tree
+          VERSION="$(grep '^version:' pubspec.yaml | awk '{print $2}' | cut -d+ -f1)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "bundle=clone-studio-$VERSION-${{ matrix.fp_arch }}.flatpak" >> "$GITHUB_OUTPUT"
+
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          manifest-path: packaging/flatpak/com.dhivalabs.clone_studio.yml
+          bundle: ${{ steps.v.outputs.bundle }}
+          arch: ${{ matrix.fp_arch }}
+          cache: false
+          artifact-name: flatpak-${{ matrix.arch }}
+
+  # Installs the bundle the way a user would (runtime from Flathub) on an
+  # Ubuntu runner and checks it inside the sandbox: every library resolves,
+  # openssl (from the runtime) makes the app's TLS identity, the host-command
+  # shims answer from the host (`flatpak list` there must list this app),
+  # and the sandboxed app paints its UI (smoke.sh). Not in the builder image:
+  # GTK finds no GL implementation under its Xvfb, so Flutter never paints
+  # there.
+  flatpak-run:
+    name: Flatpak on Ubuntu ${{ matrix.arch }}
+    needs: [flatpak]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64, fp_arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: arm64, fp_arch: aarch64, runner: ubuntu-24.04-arm }
+    env:
+      APP_ID: com.dhivalabs.clone_studio
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: flatpak-${{ matrix.arch }}
+          path: bundle
+
+      # xvfb, xauth, dbus-x11: the smoke run. A fresh home directory, as
+      # smoke.sh expects.
+      - name: Install Flatpak and a display
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak xvfb xauth dbus-x11
+          mkdir -p "$RUNNER_TEMP/home"
+          echo "HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
+
+      - name: Install the bundle with its runtime from Flathub
+        run: |
+          flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          VERSION="$(grep '^version:' pubspec.yaml | awk '{print $2}' | cut -d+ -f1)"
+          flatpak install --user -y --noninteractive "bundle/clone-studio-$VERSION-${{ matrix.fp_arch }}.flatpak"
+          flatpak info --user --show-permissions "$APP_ID"
+
+      - name: Check the bundle inside the sandbox
+        run: |
+          flatpak run --command=sh "$APP_ID" -s < packaging/flatpak/ldd-check.sh
+          # openssl, df and chmod come from the runtime; apt-mark, flatpak,
+          # snap, dconf and pkexec must be the host-command shims.
+          flatpak run --command=sh "$APP_ID" -c '
+            set -eu
+            openssl version
+            df -B1 --output=avail "$HOME"
+            command -v chmod
+            for c in apt-mark flatpak snap dconf pkexec; do
+              [ "$(readlink -f "$(command -v "$c")")" = /app/libexec/clone-studio/host-command ]
+            done
+          '
+
+      - name: Run the sandboxed app (Xvfb)
+        timeout-minutes: 5
+        run: |
+          export SMOKE_FB="$RUNNER_TEMP/fb"
+          mkdir -p "$SMOKE_FB"
+          # The runner has no login session, so no XDG_RUNTIME_DIR.
+          if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+            export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg-runtime"
+            mkdir -p -m 0700 "$XDG_RUNTIME_DIR"
+          fi
+          cat > "$RUNNER_TEMP/session.sh" <<'EOF'
+          set -euo pipefail
+          # flatpak-spawn --host goes through flatpak-session-helper on this
+          # session bus. The app's own query, answered by the host's flatpak.
+          flatpak run --command=flatpak "$APP_ID" list --app --columns=application \
+            | tee "$RUNNER_TEMP/host-apps.txt"
+          grep -x "$APP_ID" "$RUNNER_TEMP/host-apps.txt"
+          OPENSSL="flatpak run --command=openssl $APP_ID" \
+            bash packaging/linux-distros/smoke.sh flatpak run "$APP_ID"
+          EOF
+          xvfb-run -a -s "-screen 0 1280x800x24 -fbdir $SMOKE_FB" \
+            dbus-run-session -- bash "$RUNNER_TEMP/session.sh"
+
   # The snap is built from the same sources by snapcraft in an LXD container.
   # It is a workflow artifact only: nothing is uploaded to the Snap Store.
   snap:
@@ -221,7 +454,7 @@ jobs:
   # the upload step is gated, and this is the only job that can write.
   release:
     name: Release assets
-    needs: [linux]
+    needs: [linux, distros, aur, flatpak-run]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -238,13 +471,39 @@ jobs:
           path: assets
           merge-multiple: true
 
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: 'distros-*'
+          path: assets
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: aur
+          path: assets
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: 'flatpak-*'
+          path: assets
+          merge-multiple: true
+
       - name: Select the release assets
         id: select
         run: |
           VERSION="$(grep '^version:' pubspec.yaml | awk '{print $2}' | cut -d+ -f1)"
-          FILES="assets/clone-studio_${VERSION}_amd64.deb assets/clone-studio_${VERSION}_arm64.deb"
+          FILES="assets/clone-studio-bin-${VERSION}-aur.tar.gz"
+          for arch in amd64:x86_64 arm64:aarch64; do
+            deb_arch="${arch%%:*}"
+            uname_arch="${arch##*:}"
+            FILES="$FILES assets/clone-studio_${VERSION}_${deb_arch}.deb"
+            FILES="$FILES assets/clone-studio-${VERSION}-1.${uname_arch}.rpm"
+            FILES="$FILES assets/clone-studio-${VERSION}-1-${uname_arch}.pkg.tar.zst"
+            FILES="$FILES assets/CloneStudio-${VERSION}-${uname_arch}.AppImage"
+            FILES="$FILES assets/clone-studio-${VERSION}-${uname_arch}.flatpak"
+          done
           ls -l assets
-          [ "$(ls assets | wc -l)" -eq 2 ]
+          [ "$(ls assets | wc -l)" -eq 11 ]
           ls -l $FILES
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "files=$FILES" >> "$GITHUB_OUTPUT"

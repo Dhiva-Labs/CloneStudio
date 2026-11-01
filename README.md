@@ -2,6 +2,7 @@
 
 [![ARM64 builds](https://github.com/Dhiva-Labs/CloneStudio/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Dhiva-Labs/CloneStudio/actions/workflows/ci.yml)
 ![Linux x64 | arm64](https://img.shields.io/badge/Linux-x64%20%7C%20arm64-informational?logo=linux&logoColor=white)
+![Linux: deb | rpm | Arch | AppImage | Flatpak](https://img.shields.io/badge/Linux-deb%20%7C%20rpm%20%7C%20Arch%20%7C%20AppImage%20%7C%20Flatpak-informational?logo=linux&logoColor=white)
 
 Move everything to your new Linux computer — safely, step by step.
 
@@ -53,6 +54,66 @@ packaging/build_deb.sh          # writes dist/clone-studio_<version>_<arch>.deb
 
 The package is built for the architecture of the machine it runs on: `amd64`
 on an x64 machine and `arm64` on an arm64 one.
+
+### Other distributions
+
+CI builds these from the same release build as the `.deb`, for x64
+(`x86_64`) and arm64 (`aarch64`), and attaches them to releases from the next
+release on. They are built on Ubuntu 24.04, so they need a distribution at
+least that new (glibc 2.39): Fedora 40 or later, RHEL/Rocky/Alma 10, openSUSE
+Tumbleweed, current Arch Linux. openSUSE Leap 15 and RHEL 9 are too old. The
+`.rpm` declares the glibc version it needs, so dnf and zypper refuse a system
+that is too old instead of installing an app that cannot start.
+
+On these distributions the "Applications" category lists Flatpak and snap
+apps; the list of manually installed packages comes from `apt-mark`, which
+only Debian and Ubuntu have.
+
+**Fedora, RHEL, Rocky, Alma** (`.rpm`; dnf installs openssl and GTK 3 with
+it):
+
+```bash
+sudo dnf install ./clone-studio-<version>-1.x86_64.rpm     # or .aarch64.rpm
+```
+
+**openSUSE Tumbleweed** (the same `.rpm`; it is not signed):
+
+```bash
+sudo zypper install --allow-unsigned-rpm ./clone-studio-<version>-1.x86_64.rpm
+```
+
+**Arch Linux, Manjaro, EndeavourOS** (`.pkg.tar.zst`; depends on `gtk3` and
+`openssl`):
+
+```bash
+sudo pacman -U ./clone-studio-<version>-1-x86_64.pkg.tar.zst  # or -aarch64
+```
+
+Each release also carries `clone-studio-bin-<version>-aur.tar.gz`, the
+PKGBUILD and `.SRCINFO` of an AUR `clone-studio-bin` package that repackages
+the release `.deb`. It is not on the AUR yet.
+
+**AppImage** (any glibc distribution with GTK 3 and the `openssl` command):
+
+```bash
+chmod +x CloneStudio-<version>-x86_64.AppImage                # or -aarch64
+./CloneStudio-<version>-x86_64.AppImage
+```
+
+**Flatpak** (the GNOME 51 runtime comes from Flathub):
+
+```bash
+flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+flatpak install --user ./clone-studio-<version>-x86_64.flatpak # or -aarch64
+flatpak run com.dhivalabs.clone_studio
+```
+
+The Flatpak has the access a migration needs: your whole home directory
+(dotfiles, `~/.config` and `~/.ssh` included), mounted media for the USB
+transport, the network, and permission to run commands on the host, which
+it uses to ask the host's `apt-mark`, `flatpak`, `snap` and `dconf` what is
+installed and to run the reinstall script with `pkexec`. See
+[packaging/flatpak/README.md](packaging/flatpak/README.md).
 
 ## Development
 
