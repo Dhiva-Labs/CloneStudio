@@ -352,6 +352,18 @@ jobs:
           export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg-runtime" SMOKE_FB="$RUNNER_TEMP/fb"
           mkdir -p -m 0700 "$XDG_RUNTIME_DIR"
           mkdir -p "$SMOKE_FB"
+          # The job runs as root, but $HOME is the runner user's bind mount
+          # and the sandbox drops root's capabilities. Own it, so the app
+          # can write there as it would in a desktop session.
+          chown "$(id -u):$(id -g)" "$HOME"
+          # The builder image has flatpak-session-helper, which answers
+          # flatpak-spawn --host, but not its D-Bus service file, so the
+          # session bus cannot start it. A desktop's flatpak package has one;
+          # this is the same file, in the bus's per-user service directory.
+          svc="$HOME/.local/share/dbus-1/services"
+          mkdir -p "$svc"
+          printf '%s\n' '[D-BUS Service]' 'Name=org.freedesktop.Flatpak' \
+            'Exec=/app/libexec/flatpak-session-helper' > "$svc/org.freedesktop.Flatpak.service"
           cat > "$RUNNER_TEMP/session.sh" <<'EOF'
           set -euo pipefail
           # flatpak-spawn --host goes through flatpak-session-helper on this
