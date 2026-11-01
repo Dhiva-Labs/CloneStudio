@@ -360,7 +360,11 @@ jobs:
           # flatpak-spawn --host, but not its D-Bus service file, so the
           # session bus cannot start it. A desktop's flatpak package has one;
           # this is the same file, in the bus's per-user service directory.
-          svc="$HOME/.local/share/dbus-1/services"
+          # dbus finds that directory from the passwd home (/root here), not
+          # $HOME, unless XDG_DATA_HOME is set; this value is also the
+          # default flatpak --user used for the install above.
+          export XDG_DATA_HOME="$HOME/.local/share"
+          svc="$XDG_DATA_HOME/dbus-1/services"
           mkdir -p "$svc"
           printf '%s\n' '[D-BUS Service]' 'Name=org.freedesktop.Flatpak' \
             'Exec=/app/libexec/flatpak-session-helper' > "$svc/org.freedesktop.Flatpak.service"
