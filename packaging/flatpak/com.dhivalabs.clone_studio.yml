@@ -1,0 +1,70 @@
+# Flatpak manifest for Clone Studio.
+#
+# Like the .rpm, Arch package and AppImage, this repackages the installed
+# tree of the .deb that CI builds (unpacked into packaging/flatpak/tree/ by
+# the workflow), so the Flatpak ships the same binary as every other format
+# instead of a second build inside the sandbox. A Flathub submission needs
+# `tree` swapped for an archive source (release URL + sha256); see README.md
+# in this directory.
+#
+# Clone Studio reads and restores the whole home directory, dotfiles
+# included, talks to the other computer over the network, and asks the host
+# what it has installed. Those needs are the permissions below.
+id: com.dhivalabs.clone_studio
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+command: clone-studio
+finish-args:
+  # GTK needs a display socket; fallback-x11 covers X11-only desktops.
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  # GPU acceleration for Flutter's renderer.
+  - --device=dri
+  # Discovery (UDP broadcast) and the TLS transfer, as client and server.
+  - --share=network
+  # What it moves: personal folders, ~/.config, ~/.local/share, browser
+  # profiles, ~/.ssh and dotfiles, read on the old computer and written on
+  # the new one, plus its own identity and resume journal. The snap needs a
+  # personal-files plug per category for the same thing.
+  - --filesystem=home
+  # The USB drive transport: bundles written to and read from mounted media.
+  - --filesystem=/media
+  - --filesystem=/run/media
+  - --filesystem=/mnt
+  # The "Applications" and "Desktop look & feel" categories ask the host,
+  # not the sandbox: apt-mark, flatpak, snap and dconf, and pkexec runs the
+  # reinstall script there. The shims in /app/bin reach them with
+  # flatpak-spawn --host, which needs this. It lets the app run commands on
+  # the host; an app that may write ~/.bashrc and ~/.ssh has that power
+  # already.
+  - --talk-name=org.freedesktop.Flatpak
+modules:
+  - name: host-commands
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 host-command.sh /app/libexec/clone-studio/host-command
+      - install -d /app/bin && for c in apt-mark flatpak snap dconf pkexec; do ln -s ../libexec/clone-studio/host-command /app/bin/$c; done
+    sources:
+      - type: script
+        dest-filename: host-command.sh
+        commands:
+          - exec flatpak-spawn --host "$(basename "$0")" "$@"
+
+  - name: clone-studio
+    buildsystem: simple
+    sources:
+      - type: dir
+        path: tree
+        dest: tree
+      - type: file
+        path: com.dhivalabs.clone_studio.metainfo.xml
+    build-commands:
+      # Flutter finds lib/ and data/ next to its executable.
+      - install -d /app/lib && cp -a tree/usr/lib/clone-studio /app/lib/clone-studio
+      - ln -s ../lib/clone-studio/clone_studio /app/bin/clone-studio
+      - install -Dm644 tree/usr/share/applications/clone-studio.desktop /app/share/applications/com.dhivalabs.clone_studio.desktop
+      - desktop-file-edit --set-icon=com.dhivalabs.clone_studio /app/share/applications/com.dhivalabs.clone_studio.desktop
+      - for s in 48 128 256; do install -Dm644 tree/usr/share/icons/hicolor/${s}x${s}/apps/clone-studio.png /app/share/icons/hicolor/${s}x${s}/apps/com.dhivalabs.clone_studio.png; done
+      - install -Dm644 com.dhivalabs.clone_studio.metainfo.xml /app/share/metainfo/com.dhivalabs.clone_studio.metainfo.xml

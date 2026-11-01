@@ -49,3 +49,6 @@ dist/
 
 # Snap packages built by snapcraft
 *.snap
+
+# Installed tree the Flatpak job unpacks from the .deb
+/packaging/flatpak/tree/
