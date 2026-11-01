@@ -230,6 +230,13 @@ jobs:
           # The Flatpak job builds from the same tree; tar keeps modes and symlinks.
           tar -C "$RUNNER_TEMP/root" -cJf "$RUNNER_TEMP/tree.tar.xz" .
 
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tree-${{ matrix.arch }}
+          path: ${{ runner.temp }}/tree.tar.xz
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Install and run on Fedora, openSUSE and Arch
         run: packaging/linux-distros/verify.sh dist ${{ matrix.deb_arch }}
 
@@ -241,13 +248,6 @@ jobs:
             dist/*.pkg.tar.zst
             dist/*.AppImage
           if-no-files-found: error
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: tree-${{ matrix.arch }}
-          path: ${{ runner.temp }}/tree.tar.xz
-          if-no-files-found: error
-          retention-days: 3
 
   # AUR recipe: PKGBUILD + .SRCINFO for clone-studio-bin, rendered with the
   # checksums of the .debs built above and proven with makepkg and an
@@ -286,6 +286,9 @@ jobs:
   flatpak:
     name: Flatpak ${{ matrix.arch }}
     needs: [distros]
+    # It only needs the tree, which distros uploads before its distribution
+    # checks, so a Flatpak problem shows in the same run as a failed check.
+    if: ${{ !cancelled() && needs.distros.result != 'skipped' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     container:
