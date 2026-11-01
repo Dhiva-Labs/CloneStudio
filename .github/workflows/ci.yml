@@ -278,11 +278,8 @@ jobs:
           path: dist/*-aur.tar.gz
           if-no-files-found: error
 
-  # The Flatpak, built from the same installed tree. The bundle is installed
-  # in the builder image and checked inside the sandbox: every library
-  # resolves, openssl (from the runtime) makes the app's TLS identity, the
-  # host-command shims answer from the host (`flatpak list` there must list
-  # this app), and the sandboxed app paints its UI (smoke.sh).
+  # The Flatpak, built from the same installed tree in the Flathub builder
+  # image. The next job tests the bundle.
   flatpak:
     name: Flatpak ${{ matrix.arch }}
     needs: [distros]
@@ -300,8 +297,6 @@ jobs:
         include:
           - { arch: x64, fp_arch: x86_64, runner: ubuntu-24.04 }
           - { arch: arm64, fp_arch: aarch64, runner: ubuntu-24.04-arm }
-    env:
-      APP_ID: com.dhivalabs.clone_studio
     steps:
       - uses: actions/checkout@v7
 
@@ -327,12 +322,52 @@ jobs:
           cache: false
           artifact-name: flatpak-${{ matrix.arch }}
 
-      - name: Install the bundle and check it inside the sandbox
-        env:
-          BUNDLE: ${{ steps.v.outputs.bundle }}
+  # Installs the bundle the way a user would (runtime from Flathub) on an
+  # Ubuntu runner and checks it inside the sandbox: every library resolves,
+  # openssl (from the runtime) makes the app's TLS identity, the host-command
+  # shims answer from the host (`flatpak list` there must list this app),
+  # and the sandboxed app paints its UI (smoke.sh). Not in the builder image:
+  # GTK finds no GL implementation under its Xvfb, so Flutter never paints
+  # there.
+  flatpak-run:
+    name: Flatpak on Ubuntu ${{ matrix.arch }}
+    needs: [flatpak]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64, fp_arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: arm64, fp_arch: aarch64, runner: ubuntu-24.04-arm }
+    env:
+      APP_ID: com.dhivalabs.clone_studio
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: flatpak-${{ matrix.arch }}
+          path: bundle
+
+      # xvfb, xauth, dbus-x11: the smoke run. A fresh home directory, as
+      # smoke.sh expects.
+      - name: Install Flatpak and a display
         run: |
-          flatpak install --user -y --noninteractive "$BUNDLE"
+          sudo apt-get update
+          sudo apt-get install -y flatpak xvfb xauth dbus-x11
+          mkdir -p "$RUNNER_TEMP/home"
+          echo "HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
+
+      - name: Install the bundle with its runtime from Flathub
+        run: |
+          flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          VERSION="$(grep '^version:' pubspec.yaml | awk '{print $2}' | cut -d+ -f1)"
+          flatpak install --user -y --noninteractive "bundle/clone-studio-$VERSION-${{ matrix.fp_arch }}.flatpak"
           flatpak info --user --show-permissions "$APP_ID"
+
+      - name: Check the bundle inside the sandbox
+        run: |
           flatpak run --command=sh "$APP_ID" -s < packaging/flatpak/ldd-check.sh
           # openssl, df and chmod come from the runtime; apt-mark, flatpak,
           # snap, dconf and pkexec must be the host-command shims.
@@ -349,25 +384,13 @@ jobs:
       - name: Run the sandboxed app (Xvfb)
         timeout-minutes: 5
         run: |
-          export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg-runtime" SMOKE_FB="$RUNNER_TEMP/fb"
-          mkdir -p -m 0700 "$XDG_RUNTIME_DIR"
+          export SMOKE_FB="$RUNNER_TEMP/fb"
           mkdir -p "$SMOKE_FB"
-          # The job runs as root, but $HOME is the runner user's bind mount
-          # and the sandbox drops root's capabilities. Own it, so the app
-          # can write there as it would in a desktop session.
-          chown "$(id -u):$(id -g)" "$HOME"
-          # The builder image has flatpak-session-helper, which answers
-          # flatpak-spawn --host, but not its D-Bus service file, so the
-          # session bus cannot start it. A desktop's flatpak package has one;
-          # this is the same file, in the bus's per-user service directory.
-          # dbus finds that directory from the passwd home (/root here), not
-          # $HOME, unless XDG_DATA_HOME is set; this value is also the
-          # default flatpak --user used for the install above.
-          export XDG_DATA_HOME="$HOME/.local/share"
-          svc="$XDG_DATA_HOME/dbus-1/services"
-          mkdir -p "$svc"
-          printf '%s\n' '[D-BUS Service]' 'Name=org.freedesktop.Flatpak' \
-            'Exec=/app/libexec/flatpak-session-helper' > "$svc/org.freedesktop.Flatpak.service"
+          # The runner has no login session, so no XDG_RUNTIME_DIR.
+          if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+            export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg-runtime"
+            mkdir -p -m 0700 "$XDG_RUNTIME_DIR"
+          fi
           cat > "$RUNNER_TEMP/session.sh" <<'EOF'
           set -euo pipefail
           # flatpak-spawn --host goes through flatpak-session-helper on this
@@ -431,7 +454,7 @@ jobs:
   # the upload step is gated, and this is the only job that can write.
   release:
     name: Release assets
-    needs: [linux, distros, aur, flatpak]
+    needs: [linux, distros, aur, flatpak-run]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

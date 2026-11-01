@@ -26,7 +26,8 @@ The manifest has two modules:
 `openssl` (the TLS identity), `df` and `chmod` come from the GNOME runtime
 and run inside the sandbox.
 
-CI then installs the bundle and checks, inside the sandbox, that every ELF
+The `flatpak-run` job then installs the bundle on a plain Ubuntu runner, the
+way a user would (runtime from Flathub), and checks, inside the sandbox, that every ELF
 file under `/app` finds its libraries (`ldd-check.sh`), that `openssl`, `df`
 and `chmod` work and the five host commands are the shims, and that
 `flatpak list --app` run inside the sandbox is answered by the host (it must
