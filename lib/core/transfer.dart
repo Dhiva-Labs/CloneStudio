@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 
 import '../models/selection.dart';
 import 'journal.dart';
+import 'restore_safety.dart';
 import 'scanner.dart';
 import 'session.dart';
 
@@ -425,12 +426,17 @@ class ReceiverController extends ProgressSource {
           }
           notifyListeners();
         case 'dir':
-          await Directory('$root/${msg['p']}').create(recursive: true);
+          final dir = safeDest(root, msg['p'] as String);
+          if (dir != null) await Directory(dir).create(recursive: true);
         case 'symlink':
-          final path = '$root/${msg['p']}';
+          // The link may point anywhere (home directories legitimately link
+          // into /usr or /media); what matters is that no later write ever
+          // travels through it, which safeDest guarantees for every path.
+          final path = safeDest(root, msg['p'] as String);
           try {
-            if (FileSystemEntity.typeSync(path, followLinks: false) ==
-                FileSystemEntityType.notFound) {
+            if (path != null &&
+                FileSystemEntity.typeSync(path, followLinks: false) ==
+                    FileSystemEntityType.notFound) {
               await Link(path).create(msg['t'] as String, recursive: true);
             }
           } catch (_) {}
@@ -457,14 +463,17 @@ class ReceiverController extends ProgressSource {
     final mtime = msg['mtime'] as int?;
     currentItem = rel;
 
+    final safe = safeDest(root, rel);
     final trimmedOut = _includeFilter != null && !_includeFilter!.contains(rel);
     final alreadyHave =
-        journal.has(rel, size) && File('$root/$rel').existsSync();
-    // "consume without writing": bundle files the user unticked, or files a
-    // resume already completed.
-    final skip = trimmedOut || alreadyHave;
+        safe != null && journal.has(rel, size) && File(safe).existsSync();
+    // "consume without writing": bundle files the user unticked, files a
+    // resume already completed, or a path that would land outside the
+    // target (counted as failed so the summary shows something was dropped).
+    final skip = trimmedOut || alreadyHave || safe == null;
+    if (safe == null) failedFiles++;
 
-    var dest = '$root/$rel';
+    var dest = safe ?? '';
     if (!skip && File(dest).existsSync()) {
       dest = _keepBothPath(dest); // never silently overwrite what was there
     }
@@ -476,6 +485,9 @@ class ReceiverController extends ProgressSource {
     if (!skip) {
       partial = File('$dest.partial');
       await partial.parent.create(recursive: true);
+      // A link planted at the .partial name would make the open below write
+      // through it; the partial is rewritten from scratch anyway.
+      if (isLink(partial.path)) await Link(partial.path).delete();
       raf = await partial.open(mode: FileMode.write);
     }
 
@@ -517,6 +529,16 @@ class ReceiverController extends ProgressSource {
     await raf!.flush(); // on disk before the rename makes it "real"
     await raf.close();
     await partial!.rename(dest);
+    var recordedSize = size;
+    var recordedSha = gotSha;
+    // The installer's inputs are never taken as sent: the script is
+    // regenerated and the package lists filtered to valid names.
+    final fixed = sanitizeRestoreFile(rel, await File(dest).readAsBytes());
+    if (fixed != null) {
+      await File(dest).writeAsBytes(fixed, flush: true);
+      recordedSize = fixed.length;
+      recordedSha = crypto.sha256.convert(fixed).toString();
+    }
     if (mode != 420 && mode != 436) {
       try {
         await Process.run('chmod', [mode.toRadixString(8), dest]);
@@ -528,7 +550,7 @@ class ReceiverController extends ProgressSource {
             .setLastModified(DateTime.fromMillisecondsSinceEpoch(mtime));
       } catch (_) {}
     }
-    await journal.add(rel, size, gotSha);
+    await journal.add(rel, recordedSize, recordedSha);
     doneFiles++;
   }
 
