@@ -391,6 +391,10 @@ class ReceiverController extends ProgressSource {
       await _receiveLoopInner();
     } on _Interrupted {
       // fail() was already called with the friendly message
+    } on SocketException {
+      await _journal?.save();
+      fail('The connection was interrupted. Nothing is lost — reopen '
+          'Clone Studio on both computers to continue.');
     }
   }
 
@@ -447,8 +451,16 @@ class ReceiverController extends ProgressSource {
           await journal.save();
           setState_(TransferState.verifying);
           await _verify(root, journal);
-          writer?.sendJson({'type': 'ack'});
-          await writer?.flush();
+          // The ack only tells the old computer it can stop waiting. By now
+          // every file is written, verified and journaled, so a sender that
+          // has already hung up does not make this side's transfer any less
+          // finished.
+          try {
+            writer?.sendJson({'type': 'ack'});
+            await writer?.flush();
+          } on SocketException {
+            // nothing to tell
+          }
           setState_(TransferState.done);
           return;
       }

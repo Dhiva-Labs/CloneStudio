@@ -1,12 +1,14 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:clone_studio/core/bundle.dart';
 import 'package:clone_studio/core/discovery.dart';
 import 'package:clone_studio/core/identity.dart';
 import 'package:clone_studio/core/pairing.dart';
 import 'package:clone_studio/core/scanner.dart';
+import 'package:clone_studio/core/session.dart';
 import 'package:clone_studio/core/transfer.dart';
 import 'package:clone_studio/models/selection.dart';
 import 'package:crypto/crypto.dart' as crypto;
@@ -60,6 +62,61 @@ Future<(Session, Session)> loopbackPair() async {
   }
   server.stop();
   return (server.session!, client);
+}
+
+/// Passes messages through until [files] files have fully arrived, then
+/// cuts the connection. Interrupting on a timer raced the transfer: on a
+/// fast machine everything could land before the cut, and the test then
+/// checked a finished transfer for an interruption.
+class CutAfterFiles implements WireReader {
+  CutAfterFiles(this.inner, this.files, this.onCut);
+  final WireReader inner;
+  final int files;
+  final void Function() onCut;
+  int _seen = 0;
+  bool _cut = false;
+
+  @override
+  Future<Map<String, dynamic>?> readJson({Duration? timeout}) async {
+    if (_cut) return null;
+    final msg = await (timeout == null
+        ? inner.readJson()
+        : inner.readJson(timeout: timeout));
+    if (msg?['type'] == 'file_end' && ++_seen >= files) {
+      // Hand over this file_end so the file counts as received, then
+      // everything after it is lost.
+      _cut = true;
+      onCut();
+    }
+    return msg;
+  }
+
+  @override
+  Future<Uint8List?> readFrame({Duration? timeout}) async {
+    if (_cut) return null;
+    return timeout == null
+        ? inner.readFrame()
+        : inner.readFrame(timeout: timeout);
+  }
+}
+
+/// Fails the receiver's final ack as if the sender had hung up the moment
+/// it sent "complete".
+class SenderGoneBeforeAck implements WireWriter {
+  SenderGoneBeforeAck(this.inner);
+  final WireWriter inner;
+
+  @override
+  void sendJson(Map<String, dynamic> msg) {
+    if (msg['type'] == 'ack') throw const SocketException('connection closed');
+    inner.sendJson(msg);
+  }
+
+  @override
+  void sendFrame(List<int> payload) => inner.sendFrame(payload);
+
+  @override
+  Future<void> flush() => inner.flush();
 }
 
 /// The source's selection = every scanned leaf in the given categories.
@@ -156,20 +213,19 @@ void main() {
     final scan = await scanEverything();
     final selection = pick(scan, {'desktop', 'documents', 'pictures'});
 
-    // Round 1: cut the connection mid-transfer.
+    // Round 1: cut the connection right after the second file arrives.
     final (s1, r1) = await loopbackPair();
     final sender1 = SenderController(s1, s1)..setPlan(scan, selection);
-    final receiver1 = ReceiverController(r1, r1);
+    final receiver1 = ReceiverController(
+        CutAfterFiles(r1, 2, () {
+          r1.close();
+          s1.close();
+        }),
+        r1);
     final serving1 = sender1.serve();
     await receiver1.receiveOffer();
     final include1 = {for (final l in receiver1.offerLeaves) l.rel};
-    final started = receiver1.startReceive(include1);
-    while (receiver1.doneFiles < 2 && receiver1.state != TransferState.done) {
-      await Future<void>.delayed(const Duration(milliseconds: 5));
-    }
-    r1.close();
-    s1.close();
-    await started;
+    await receiver1.startReceive(include1);
     await serving1;
 
     expect(receiver1.state, TransferState.error);
@@ -194,6 +250,28 @@ void main() {
 
     s2.close();
     r2.close();
+  });
+
+  test('a sender that hangs up before the ack does not fail a finished transfer',
+      () async {
+    final scan = await scanEverything();
+    final selection = pick(scan, {'desktop', 'pictures'});
+    final (s, r) = await loopbackPair();
+    final sender = SenderController(s, s)..setPlan(scan, selection);
+    final receiver = ReceiverController(r, SenderGoneBeforeAck(r));
+    final serving = sender.serve();
+    await receiver.receiveOffer();
+    await receiver.startReceive({for (final l in receiver.offerLeaves) l.rel});
+
+    expect(receiver.state, TransferState.done);
+    expect(receiver.failedFiles, 0);
+    expect(shaOf('$dst/Pictures/photo.bin'), shaOf('$src/Pictures/photo.bin'));
+
+    // The sender never hears the ack; closing the link releases it.
+    s.close();
+    r.close();
+    await serving;
+    expect(sender.state, isNot(TransferState.done));
   });
 
   test('pre-existing target files are kept, not overwritten', () async {
