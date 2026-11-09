@@ -7,16 +7,28 @@ import 'package:flutter/foundation.dart';
 
 import 'discovery.dart';
 import 'identity.dart';
+import 'pake.dart';
 import 'session.dart';
 
 export 'session.dart' show Session;
 
-/// MAC binding the PIN to the TLS certificate fingerprint the client saw.
-/// A man-in-the-middle presents its own certificate, so its fingerprint
-/// won't match and the MAC verification fails on the server.
-List<int> _mac(String pin, List<int> salt, List<int> nonce, List<int> fp) {
-  final key = crypto.Hmac(crypto.sha256, utf8.encode(pin)).convert(salt).bytes;
-  return crypto.Hmac(crypto.sha256, key).convert([...nonce, ...fp]).bytes;
+/// Pairing protocol version. Version 1 had the new computer send a MAC
+/// keyed by the PIN and then trust a bare "ok": the old computer never
+/// proved it knew the PIN, and whoever received that MAC could recover the
+/// six digits offline in under a second. Version 2 is a password-
+/// authenticated key exchange with confirmation in both directions (see
+/// pake.dart).
+const pairingVersion = 2;
+
+List<int>? _decode(Object? value, {int? length}) {
+  if (value is! String) return null;
+  try {
+    final bytes = base64Decode(value);
+    if (length != null && bytes.length != length) return null;
+    return bytes;
+  } on FormatException {
+    return null;
+  }
 }
 
 bool _sameBytes(List<int> a, List<int> b) {
@@ -39,7 +51,9 @@ String _randomPin() {
 }
 
 /// OLD computer: accepts one connection and checks its PIN.
-/// After three wrong guesses the PIN is regenerated.
+/// Every exchange lets the other side test exactly one PIN, so each one
+/// counts as a guess whether or not it is completed; after three the PIN is
+/// regenerated.
 class PairingServer extends ChangeNotifier {
   PairingServer(this.identity);
 
@@ -80,38 +94,66 @@ class PairingServer extends ChangeNotifier {
         s.close();
         return;
       }
-      final nonce = _randBytes(16);
-      final salt = _randBytes(16);
-      s.sendJson({
-        'type': 'challenge',
-        'nonce': base64Encode(nonce),
-        'salt': base64Encode(salt),
-      });
-      final auth = await s.readJson();
-      if (auth == null || auth['type'] != 'auth') {
+      final clientShare = _decode(hello['share'], length: 32);
+      if (hello['v'] != pairingVersion || clientShare == null) {
+        // An older Clone Studio. Tell it so rather than leaving it to guess.
+        s.sendJson({'type': 'upgrade', 'v': pairingVersion});
+        await socket.flush();
         s.close();
         return;
       }
-      final expected = _mac(pin, salt, nonce, identity.fingerprint);
-      final got = base64Decode(auth['mac'] as String);
-      if (!_sameBytes(expected, got)) {
-        _attempts++;
-        if (_attempts >= 3) {
-          pin = _randomPin();
-          _attempts = 0;
-        }
+      // Our reply carries a confirmation the peer can check one PIN
+      // against, so the guess is spent the moment we answer, not when (or
+      // if) the peer reports back. Counted before any await so that
+      // connections opened in parallel cannot each get a free try.
+      _rotateIfSpent();
+      _attempts++;
+      final secret = _randBytes(32);
+      final serverShare =
+          pakeShare(secret, pakeGenerator(pin, identity.fingerprint));
+      final keys = pakeKeys(
+        secret: secret,
+        peerShare: clientShare,
+        clientShare: clientShare,
+        serverShare: serverShare,
+        fingerprint: identity.fingerprint,
+      );
+      if (keys == null) {
+        _rotateIfSpent();
+        s.close();
+        notifyListeners();
+        return;
+      }
+      s.sendJson({
+        'type': 'pake',
+        'share': base64Encode(serverShare),
+        'confirm': base64Encode(keys.serverConfirm),
+      });
+      final auth = await s.readJson();
+      final got =
+          auth != null && auth['type'] == 'confirm' ? _decode(auth['confirm']) : null;
+      if (got == null || !_sameBytes(keys.clientConfirm, got)) {
+        _rotateIfSpent();
         s.sendJson({'type': 'bad'});
         await socket.flush();
         s.close();
         notifyListeners();
         return;
       }
+      _attempts = 0;
       s.peerName = (hello['name'] as String?) ?? 'New computer';
       s.sendJson({'type': 'ok', 'name': identity.deviceName});
       session = s;
       notifyListeners();
     } catch (_) {
       socket.destroy();
+    }
+  }
+
+  void _rotateIfSpent() {
+    if (_attempts >= 3) {
+      pin = _randomPin();
+      _attempts = 0;
     }
   }
 
@@ -127,7 +169,8 @@ class PairingException implements Exception {
   final String friendly;
 }
 
-/// NEW computer: connects and proves it knows the PIN.
+/// NEW computer: connects, proves it knows the PIN, and requires the same
+/// proof from the old computer before trusting anything it sends.
 class PairingClient {
   static Future<Session> pair(RemoteDevice device, String pin,
       {required String myName}) async {
@@ -148,20 +191,50 @@ class PairingClient {
     }
     final fp = crypto.sha256.convert(cert.der).bytes;
     final s = Session(socket);
-    s.sendJson({'type': 'hello', 'name': myName});
-    final challenge = await s.readJson();
-    if (challenge == null || challenge['type'] != 'challenge') {
+    final secret = _randBytes(32);
+    final share = pakeShare(secret, pakeGenerator(pin, fp));
+    s.sendJson({
+      'type': 'hello',
+      'v': pairingVersion,
+      'name': myName,
+      'share': base64Encode(share),
+    });
+    final reply = await s.readJson();
+    if (reply != null &&
+        (reply['type'] == 'challenge' || reply['type'] == 'upgrade')) {
+      s.close();
+      throw PairingException(
+          'The two computers are running different versions of Clone '
+          'Studio. Update it on both and try again.');
+    }
+    if (reply == null || reply['type'] != 'pake') {
       s.close();
       throw PairingException(
           "The old computer didn't answer. Please try again.");
     }
-    final mac = _mac(
-      pin,
-      base64Decode(challenge['salt'] as String),
-      base64Decode(challenge['nonce'] as String),
-      fp,
-    );
-    s.sendJson({'type': 'auth', 'mac': base64Encode(mac)});
+    final serverShare = _decode(reply['share'], length: 32);
+    final serverConfirm = _decode(reply['confirm']);
+    final keys = serverShare == null
+        ? null
+        : pakeKeys(
+            secret: secret,
+            peerShare: serverShare,
+            clientShare: share,
+            serverShare: serverShare,
+            fingerprint: fp,
+          );
+    // The other side must prove it knows the code too. Without this, any
+    // machine on the network could answer as "the old computer" and push
+    // files into this one.
+    if (keys == null ||
+        serverConfirm == null ||
+        !_sameBytes(keys.serverConfirm, serverConfirm)) {
+      s.close();
+      throw PairingException(
+          "That code didn't match. Check the big code on the old "
+          "computer's screen and try again.");
+    }
+    s.sendJson({'type': 'confirm', 'confirm': base64Encode(keys.clientConfirm)});
     final result = await s.readJson();
     if (result == null || result['type'] != 'ok') {
       s.close();
