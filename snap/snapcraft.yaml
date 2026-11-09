@@ -50,7 +50,9 @@ grade: stable
 confinement: strict
 icon: snap/gui/clone-studio.png
 license: MIT
-website: https://github.com/Dhiva-Labs/CloneStudio
+website:
+  - https://github.com/Dhiva-Labs/CloneStudio
+  - https://learn.dhivalabs.com/apps/clonestudio/
 source-code: https://github.com/Dhiva-Labs/CloneStudio
 issues: https://github.com/Dhiva-Labs/CloneStudio/issues
 contact: dhivakar1010@gmail.com
