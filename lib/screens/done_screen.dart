@@ -125,6 +125,11 @@ class DoneScreen extends StatelessWidget {
         '${targetRoot()}/CloneStudio-Restore/packages/install_apps.sh';
     final messenger = ScaffoldMessenger.of(context);
     try {
+      // Always run this build's own script, never the copy that arrived
+      // from the other computer: it is about to run as root.
+      final f = File(script);
+      await f.parent.create(recursive: true);
+      await f.writeAsString(installScript(), flush: true);
       // pkexec asks for the password with the system dialog.
       await Process.start('pkexec', ['bash', script],
           mode: ProcessStartMode.detached);
