@@ -6,6 +6,8 @@
 
 Move everything to your new Linux computer — safely, step by step.
 
+**Documentation:** step-by-step guides at [learn.dhivalabs.com](https://learn.dhivalabs.com/apps/clonestudio/): [install](https://learn.dhivalabs.com/apps/clonestudio/install) · [beginner guide](https://learn.dhivalabs.com/apps/clonestudio/getting-started) · [troubleshooting](https://learn.dhivalabs.com/apps/clonestudio/faq). New to the topic? Try the [Files, backups and recovery](https://learn.dhivalabs.com/tracks/files/) learning track.
+
 Clone Studio is a beginner-proof migration assistant for Linux laptops and
 desktops. Run it on both computers, pick which one is old and which one is
 new, and it moves your files, apps, settings, SSH keys and Wi-Fi networks
